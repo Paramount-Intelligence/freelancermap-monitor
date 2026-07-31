@@ -6,3 +6,6 @@ __pycache__/
 data/*
 !data/.gitkeep
 *.csv
+*.log
+*.lock
+data/chrome_profile/

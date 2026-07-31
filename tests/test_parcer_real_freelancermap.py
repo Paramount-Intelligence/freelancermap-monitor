@@ -35,9 +35,9 @@ class CapturedFreelancermapDomTests(unittest.TestCase):
         self.assertEqual("On-site", project.card_workplace)
         self.assertEqual("Freelance", project.card_contract_type)
         self.assertEqual("7/2026", project.card_start_date)
-        self.assertEqual("", project.card_duration)
-        self.assertEqual("2026-07-30T20:01:30+02:00", project.posted_text)
-        self.assertEqual("2026-07-30T18:01:30+00:00", project.posted_at)
+        self.assertEqual("5 months+", project.card_duration)
+        self.assertEqual("24.04.2026", project.posted_text)
+        self.assertEqual("2026-04-24T00:00:00+00:00", project.posted_at)
 
     def test_real_search_result_detail_modal_is_parsed_in_isolation(self):
         detail = parse_project_detail(

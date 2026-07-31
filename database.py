@@ -20,7 +20,7 @@ from utils import json_dumps, utc_now_iso
 LOGGER = logging.getLogger(__name__)
 
 DATABASE_PATH: Path = Config.DATABASE_PATH
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # SQLite's default host-parameter ceiling is commonly 999 on older builds.
 # Keeping each dynamic IN clause below 900 preserves broad Python/SQLite
@@ -168,6 +168,8 @@ def initialize_database() -> None:
         _repair_observation_duplicates(conn)
         if _get_schema_version(conn) < 7:
             _repair_schema_v7(conn)
+        if _get_schema_version(conn) < 8:
+            _repair_schema_v8(conn)
         _create_indexes(conn)
         conn.execute(
             """
@@ -523,7 +525,7 @@ def _repair_schema_v7(conn: sqlite3.Connection) -> None:
         """
         UPDATE projects SET
             location = CASE
-                WHEN card_location <> '' AND location <> card_location
+                WHEN card_location <> '' AND (location = '' OR LOWER(location) IN ('not specified', 'n/a', 'unknown') OR location LIKE '%Report project%')
                 THEN card_location
                 ELSE location
             END,
@@ -567,6 +569,26 @@ def _repair_schema_v7(conn: sqlite3.Connection) -> None:
             "UPDATE projects SET project_length = ? WHERE id = ?",
             updates,
         )
+
+
+def _repair_schema_v8(conn: sqlite3.Connection) -> None:
+    """Repair 404/Error corrupted titles and locations from invalid detail fetches."""
+    conn.execute(
+        """
+        UPDATE projects SET
+            title = CASE WHEN title_hint <> '' THEN title_hint ELSE title END,
+            location = CASE
+                WHEN card_location <> '' AND (location = '' OR LOWER(location) IN ('not specified', 'n/a', 'unknown') OR location LIKE '%404%')
+                THEN card_location
+                ELSE location
+            END,
+            detail_fetch_status = 'failed'
+        WHERE LOWER(title) LIKE '%404%'
+           OR LOWER(title) LIKE '%not found%'
+           OR LOWER(title) LIKE '%page does not exist%'
+           OR LOWER(title) LIKE '%resource is gone%';
+        """
+    )
 
 
 def _ensure_column(

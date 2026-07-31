@@ -25,6 +25,14 @@ from utils import canonicalize_url, exclusive_file_lock, polite_sleep, utc_now_i
 LOGGER = logging.getLogger(__name__)
 
 _PROJECT_PATH_RE = re.compile(r"^/project/[^/?#]+/?$", re.IGNORECASE)
+_INVALID_TITLE_RE = re.compile(
+    r"(?:^|\b)(?:404|410|429|500|502|503)\b"
+    r"|not\s+found"
+    r"|page\s+does\s+not\s+exist"
+    r"|resource\s+is\s+gone"
+    r"|404\s+not\s+found",
+    re.I,
+)
 _INVALID_TITLES = {
     "access denied",
     "attention required",
@@ -35,6 +43,11 @@ _INVALID_TITLES = {
     "log in",
     "login",
     "page not found",
+    "404",
+    "404 not found",
+    "not found",
+    "page does not exist",
+    "resource is gone",
     "service unavailable",
     "sign in",
     "temporarily unavailable",
@@ -497,7 +510,7 @@ def validate_detail(
     """Reject login, block, unrelated, and incomplete pages before persistence."""
 
     title = str(detail.title or "").strip()
-    if not title or title.casefold() in _INVALID_TITLES:
+    if not title or title.casefold() in _INVALID_TITLES or _INVALID_TITLE_RE.search(title):
         raise DetailValidationError(
             "Project title was missing or looked like an access/login/error page."
         )

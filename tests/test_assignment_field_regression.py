@@ -148,7 +148,7 @@ class AssignmentFieldRegressionTests(unittest.TestCase):
                         (project_id,),
                     ).fetchone()
                 self.assertEqual("Full-time", row["engagement_type"])
-                self.assertEqual("Prague, Czech Republic", row["location"])
+                self.assertEqual("Remote", row["location"])
                 self.assertEqual("pending", row["detail_fetch_status"])
             finally:
                 database.DATABASE_PATH = original

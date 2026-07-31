@@ -41,6 +41,14 @@ class PageState:
     empty: bool = False
 
 
+class PageNotFoundError(Exception):
+    """Raised when a 404 or 410 Not Found page is encountered."""
+
+
+class HttpError(Exception):
+    """Raised when an HTTP error status or page error is encountered."""
+
+
 LOGIN_PATH_RE = re.compile(r"/(?:login|sign-in)(?:/|$)", re.I)
 CHALLENGE_TITLE_RE = re.compile(
     r"(?:just a moment|verify you are human|attention required|checking your browser|"
@@ -53,15 +61,23 @@ CHALLENGE_BODY_RE = re.compile(
     re.I,
 )
 ERROR_TITLE_RE = re.compile(
-    r"(?:service unavailable|internal server error|bad gateway|"
-    r"temporarily unavailable|error|503|502|403|forbidden)",
+    r"(?:^|\b)(?:404|410|429|500|502|503)\b"
+    r"|not\s+found"
+    r"|page\s+does\s+not\s+exist"
+    r"|resource\s+is\s+gone"
+    r"|service\s+unavailable|internal\s+server\s+error|bad\s+gateway|forbidden",
     re.I,
 )
 ERROR_BODY_RE = re.compile(
-    r"(?:service unavailable|internal server error|bad gateway|"
-    r"temporarily unavailable|something went wrong|try again later)",
+    r"(?:^|\b)(?:404|410|429|500|502|503)\b"
+    r"|not\s+found"
+    r"|page\s+does\s+not\s+exist"
+    r"|resource\s+is\s+gone"
+    r"|service\s+unavailable|internal\s+server\s+error|bad\s+gateway|"
+    r"temporarily\s+unavailable|something\s+went\s+wrong|try\s+again\s+later",
     re.I,
 )
+PROJECT_PATH_RE = re.compile(r"^/project/[^/?#]+$", re.I)
 RECAPTCHA_SCRIPT_ONLY_RE = re.compile(
     r"<script[^>]+src=['\"]https?://[^'\"]*recaptcha[^\"]*['\"]",
     re.I,
@@ -80,10 +96,20 @@ def _is_login_url(url: str) -> bool:
 class BrowserSession:
     """Selenium Chrome session with origin-safe navigation guards."""
 
-    def __init__(self, headless: bool | None = True) -> None:
-        self.headless = True if headless is None else bool(headless)
+    def __init__(
+        self,
+        headless: bool | None = None,
+        driver_factory: type | None = None,
+        autostart: bool = True,
+    ) -> None:
+        if headless is None:
+            self.headless = bool(getattr(Config, "HEADLESS", True))
+        else:
+            self.headless = bool(headless)
+        self.driver_factory = driver_factory
         self.driver: WebDriver | None = None
-        self._ensure_driver()
+        if autostart:
+            self._ensure_driver()
 
     def _ensure_driver(self) -> None:
         if self.driver is not None:
@@ -96,12 +122,28 @@ class BrowserSession:
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        
+        # Configure persistent Chrome profile directory
+        profile_dir = getattr(Config, "CHROME_PROFILE_DIR", None)
+        if profile_dir:
+            profile_path = profile_dir.resolve()
+            profile_path.mkdir(parents=True, exist_ok=True)
+            options.add_argument(f"--user-data-dir={profile_path}")
+
         options.add_argument(
             "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-        self.driver = webdriver.Chrome(options=options)
-        self.driver.implicitly_wait(3)
+        if self.driver_factory:
+            self.driver = self.driver_factory(options)
+        else:
+            self.driver = webdriver.Chrome(options=options)
+        
+        page_load_timeout = getattr(Config, "PAGE_LOAD_TIMEOUT", 30)
+        script_timeout = getattr(Config, "SCRIPT_TIMEOUT_SECONDS", 15)
+        self.driver.set_page_load_timeout(page_load_timeout)
+        self.driver.set_script_timeout(script_timeout)
+        self.driver.implicitly_wait(getattr(Config, "IMPLICIT_WAIT_SECONDS", 3))
 
     def close(self) -> None:
         """Quit the underlying driver and release resources."""
@@ -281,13 +323,44 @@ class BrowserSession:
             pass
         return None
 
+    def accept_cookie_banner(self) -> None:
+        """Attempt to accept cookie consent banners if present."""
+        if not self.driver:
+            return
+        selectors = [
+            "button[id*='accept']", "button[class*='accept']", "a[id*='accept']",
+            "button[id*='consent']", "button[class*='consent']",
+            "#onetrust-accept-btn-handler", ".cookie-consent-accept",
+            "button[data-testid='cookie-accept']"
+        ]
+        for sel in selectors:
+            try:
+                btns = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for btn in btns:
+                    if btn.is_displayed():
+                        btn.click()
+                        time.sleep(0.5)
+                        return
+            except Exception:
+                continue
+
     def get_project_page(self, url: str) -> str:
         """Navigate to a project detail page and return the page source HTML."""
         validated = self._validated_navigation_url(url)
-        if not re.search(r"/project/[^/?#]+", urlparse(validated).path):
+        path = urlparse(validated).path
+        if not PROJECT_PATH_RE.fullmatch(path) and not re.search(r"/project/[^/?#]+$", path):
             raise BrowserNavigationError("URL is not a project detail page")
         self.driver.get(validated)
         self._wait_for_page_load()
+        self.accept_cookie_banner()
+        
+        state = self._page_state()
+        if state.error_detected:
+            title = (self.driver.title or "").strip()
+            if ERROR_TITLE_RE.search(title) or "404" in title or "not found" in title.casefold():
+                raise PageNotFoundError(f"Detail page {url} returned 404/Error: '{title}'")
+            raise HttpError(f"Detail page {url} returned error state: '{title}'")
+            
         return self.get_page_source()
 
     def get(self, url: str) -> str:
@@ -295,13 +368,45 @@ class BrowserSession:
         validated = self._validated_navigation_url(url)
         self.driver.get(validated)
         self._wait_for_page_load()
+        self.accept_cookie_banner()
+        
+        state = self._page_state()
+        if state.error_detected:
+            title = (self.driver.title or "").strip()
+            if ERROR_TITLE_RE.search(title) or "404" in title or "not found" in title.casefold():
+                raise PageNotFoundError(f"Page {url} returned 404/Error: '{title}'")
+            raise HttpError(f"Page {url} returned error state: '{title}'")
+            
         return self.get_page_source()
 
     def load_listing_page(self, url: str) -> str:
-        """Navigate to a listing page and return its page source HTML."""
+        """Navigate to a listing page, handle cookies, scroll, and return page source HTML."""
         validated = self._validated_navigation_url(url)
         self.driver.get(validated)
         self._wait_for_page_load()
+        self.accept_cookie_banner()
+        
+        state = self._page_state()
+        if state.error_detected:
+            title = (self.driver.title or "").strip()
+            if ERROR_TITLE_RE.search(title) or "404" in title or "not found" in title.casefold():
+                raise PageNotFoundError(f"Listing page {url} returned 404/Error: '{title}'")
+            raise HttpError(f"Listing page {url} returned error state: '{title}'")
+
+        # Scroll to load dynamic content and cards
+        self.scroll_to_bottom(max_scrolls=2)
+        
+        # Click 'load more' if available
+        try:
+            load_more = self.driver.find_elements(By.CSS_SELECTOR, "button[class*='load-more'], a[class*='load-more'], button[data-testid='load-more']")
+            for btn in load_more:
+                if btn.is_displayed():
+                    btn.click()
+                    time.sleep(1.0)
+                    break
+        except Exception:
+            pass
+
         return self.get_page_source()
 
     def is_logged_in(self) -> bool:

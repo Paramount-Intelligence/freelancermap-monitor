@@ -331,6 +331,8 @@ def _project_data(row: Row | Mapping[str, Any]) -> dict[str, str]:
         "engagement_type": _value(
             row,
             "engagement_type",
+            "workload",
+            "card_workload",
             "contract_type",
             "card_contract_type",
         ),

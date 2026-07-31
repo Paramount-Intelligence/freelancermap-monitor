@@ -399,6 +399,8 @@ def test_login(
     with BrowserSession(
         headless=headless_override(visible),
     ) as browser:
+        account_url = getattr(Config, "ACCOUNT_URL", Config.BASE_URL)
+        browser.navigate(account_url)
         success = browser.is_logged_in()
 
     if success:
@@ -1026,11 +1028,7 @@ def ensure_directories() -> None:
 def headless_override(
     visible: bool,
 ) -> bool | None:
-    return (
-        False
-        if visible
-        else None
-    )
+    return False if visible else getattr(Config, "HEADLESS", True)
 
 
 def configure_logging(
