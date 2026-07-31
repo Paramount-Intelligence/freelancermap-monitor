@@ -424,7 +424,7 @@ class Config:
 
     AUTO_BASELINE_ON_FIRST_RUN = _env_bool(
         "AUTO_BASELINE_ON_FIRST_RUN",
-        True,
+        False,
     )
 
     ALLOW_EMPTY_RESULTS = _env_bool(
