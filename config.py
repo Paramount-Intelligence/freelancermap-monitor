@@ -10,6 +10,43 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 
+# Feed URLs must be listing/search routes. Detail, authentication, account, and
+# application routes are rejected so a cycle can never silently scan the wrong
+# page type.
+FEED_LISTING_BANNED_PATH_PREFIXES = (
+    "/project/",
+    "/login",
+    "/sign-in",
+    "/signin",
+    "/registration",
+    "/logout",
+    "/my_account",
+    "/account",
+    "/dashboard",
+    "/app/",
+    "/email-login",
+    "/password-request",
+)
+
+
+def _query_param_value(parsed: Any, key: str) -> str | None:
+    """Return the first query parameter value for *key*, or None."""
+    for part in (parsed.query or "").split("&"):
+        name, _, value = part.partition("=")
+        if name.casefold() == key.casefold():
+            return value or ""
+    return None
+
+
+def _is_feed_listing_path(path: str) -> bool:
+    """True when *path* looks like a project listing/search route."""
+    lowered = (path or "/").rstrip("/").casefold()
+    for prefix in FEED_LISTING_BANNED_PATH_PREFIXES:
+        if lowered.startswith(prefix):
+            return False
+    return True
+
+
 ROOT_DIR = Path(__file__).resolve().parent
 load_dotenv(ROOT_DIR / ".env", override=False)
 
@@ -284,6 +321,12 @@ class Config:
         False,
     )
 
+    # Verified against the live site: sort=1 is "Newest projects first" and
+    # sort=2 is "Relevant first" (radio input value / dropdown data-value).
+    PRIMARY_FEED_NEWEST_SORT_VALUE = "1"
+    SECONDARY_FEED_ALLOWED_SORT_VALUES = ("1", "2")
+    FEED_QUERY_SORT_PARAM = "sort"
+
     ALLOW_INSECURE_HTTP = _env_bool(
         "ALLOW_INSECURE_HTTP",
         False,
@@ -332,6 +375,14 @@ class Config:
         True,
     )
 
+    # Opt-in flags for constrained Linux/container deployments. Not enabled by
+    # default: --no-sandbox weakens Chrome's security model and
+    # --disable-dev-shm-usage can hurt performance on normal desktops.
+    CHROME_NO_SANDBOX = _env_bool(
+        "CHROME_NO_SANDBOX",
+        False,
+    )
+
     PAGE_LOAD_TIMEOUT = _env_int(
         "PAGE_LOAD_TIMEOUT",
         45,
@@ -365,6 +416,13 @@ class Config:
         6,
         minimum=0,
         maximum=100,
+    )
+
+    MAX_LOAD_MORE_CLICKS = _env_int(
+        "MAX_LOAD_MORE_CLICKS",
+        3,
+        minimum=0,
+        maximum=50,
     )
 
     LISTING_STABLE_ROUNDS = _env_int(
@@ -676,12 +734,15 @@ class Config:
 
         errors: list[str] = []
 
-        urls = (
+        urls = [
             ("FREELANCERMAP_BASE_URL", cls.BASE_URL),
             ("FREELANCERMAP_PROJECTS_URL", cls.PROJECTS_URL),
             ("FREELANCERMAP_LOGIN_URL", cls.LOGIN_URL),
             ("FREELANCERMAP_ACCOUNT_URL", cls.ACCOUNT_URL),
-        )
+            ("FREELANCERMAP_PRIMARY_SEARCH_URL", cls.PRIMARY_SEARCH_URL),
+        ]
+        if cls.PERSONALIZED_SEARCH_URL:
+            urls.append(("FREELANCERMAP_PERSONALIZED_SEARCH_URL", cls.PERSONALIZED_SEARCH_URL))
 
         for name, value in urls:
             parsed = urlparse(value)
@@ -703,6 +764,37 @@ class Config:
                     "ALLOW_INSECURE_HTTP=true only for a trusted local test "
                     "environment"
                 )
+
+            if name == "FREELANCERMAP_PRIMARY_SEARCH_URL":
+                sort_value = _query_param_value(parsed, cls.FEED_QUERY_SORT_PARAM)
+                if sort_value != cls.PRIMARY_FEED_NEWEST_SORT_VALUE:
+                    errors.append(
+                        f"{name} must be sorted newest-first (sort="
+                        f"{cls.PRIMARY_FEED_NEWEST_SORT_VALUE}). The monitor "
+                        "refuses to silently treat an unsorted or differently "
+                        "sorted feed as newest-first."
+                    )
+            elif name == "FREELANCERMAP_PERSONALIZED_SEARCH_URL":
+                sort_value = _query_param_value(parsed, cls.FEED_QUERY_SORT_PARAM)
+                if sort_value not in cls.SECONDARY_FEED_ALLOWED_SORT_VALUES:
+                    errors.append(
+                        f"{name} must include a supported sort parameter "
+                        f"(sort={cls.SECONDARY_FEED_ALLOWED_SORT_VALUES[0]} "
+                        "newest-first or "
+                        f"sort={cls.SECONDARY_FEED_ALLOWED_SORT_VALUES[1]} "
+                        "relevant-first)"
+                    )
+
+            if name in (
+                "FREELANCERMAP_PRIMARY_SEARCH_URL",
+                "FREELANCERMAP_PERSONALIZED_SEARCH_URL",
+            ):
+                if not _is_feed_listing_path(parsed.path):
+                    errors.append(
+                        f"{name} must point to a project listing/search route, "
+                        "not a detail, login, account, or app route: "
+                        f"{parsed.path}"
+                    )
 
         # Prevent a modified environment file from sending login credentials or
         # authenticated browser traffic to an unrelated origin.

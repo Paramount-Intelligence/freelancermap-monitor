@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import database
+from browser import AuthVerificationResult
 from config import Config
 from monitor import run_cycle
 
@@ -73,7 +74,7 @@ class SmokeTestBrowser:
     def __exit__(self, exc_type, exc, tb):
         return None
 
-    def load_listing_page(self, url):
+    def load_listing_page(self, url, *, expected_sort=None):
         return self.html_listing
 
     def load_detail_page(self, url):
@@ -88,6 +89,9 @@ class SmokeTestBrowser:
     def is_logged_in(self):
         return True
 
+    def verify_authenticated_session(self):
+        return AuthVerificationResult(authenticated=True, reason="Mock session authenticated")
+
 
 def run_smoke_test():
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -99,6 +103,7 @@ def run_smoke_test():
         with patch.object(Config, "DATABASE_PATH", db_path), \
              patch.object(database, "DATABASE_PATH", db_path), \
              patch.object(Config, "LOCK_PATH", lock_path), \
+             patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"), \
              patch.object(Config, "AUTO_BASELINE_ON_FIRST_RUN", True):
             
             # Step 1: Initialize fresh database

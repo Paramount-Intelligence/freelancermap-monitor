@@ -1,46 +1,76 @@
-# 🚀 Freelancermap Monitor
+# Freelancermap Monitor
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Build Status](https://img.shields.io/badge/tests-120%20passed-brightgreen.svg)]()
+[![Build Status](https://img.shields.io/badge/tests-172%20passed-brightgreen.svg)]()
 [![Code Architecture](https://img.shields.io/badge/architecture-modular-orange.svg)]()
 
-A robust, local Python monitoring tool for **Freelancermap** project listings. It automatically discovers new projects, extracts detailed assignment parameters using deep DOM and JSON-LD parsing, persists structured data alongside compressed raw HTML in SQLite, and delivers HTML email digests for newly published projects.
+A robust, local Python monitoring tool for **Freelancermap** project listings. It automatically discovers new projects from one or two search feeds, extracts detailed assignment parameters using deep DOM and JSON-LD parsing, persists structured data alongside compressed raw HTML in SQLite, and delivers HTML email digests for newly published projects.
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
 - **Automated Listing & Detail Discovery**: Periodically scans listing pages using Selenium WebDriver to capture dynamic cards, modal overlays, and React JSON state.
 - **Resilient Parsing Engine**: Resiliently extracts title, company, location, workload, rate, duration, start date, contract type, workplace model, skills, and full project descriptions.
 - **Preserves Critical Qualifiers**: Retains contract and rate qualifiers (e.g. `"6 months initial contract"`, `"€500/day (Outside IR35)"`) without premature truncation.
-- **ACID-Compliant SQLite Storage (Schema 7)**: Atomic upserts deduplicate listings by canonical URL and `source_key` while maintaining full snapshot and observation histories.
+- **ACID-Compliant SQLite Storage (Schema 9)**: Atomic upserts deduplicate listings by canonical URL and `source_key` while maintaining full snapshot and observation histories and dual-feed provenance.
+- **Dual-Feed Discovery**: Optionally scans a second (personalized/relevant) feed; projects are merged by canonical URL, enriched from whichever feed carries richer data, and their provenance (`seen_in_primary`, `seen_in_personalized`, positions, `discovery_sources_json`) is persisted per row.
+- **Authenticated Sessions**: Persistent Chrome profile keeps you logged in; the monitor verifies authentication through positive DOM markers (logout control / user menu), never by URL alone.
 - **HTML Email Digest**: Sends styled HTML email digests via SMTP (`SMTP_SSL` or `STARTTLS`) with XSS protection and strict transaction journaling.
-- **100% Reliable Recovery**: Resumes interrupted scans safely, retries failed detail fetches with bounded backoff, and ensures emails are marked sent **only after** SMTP server acceptance.
-- **Conservative & Polite Scanning**: Respects target servers with configurable polite delays, custom user-agents, and persistent Chrome profile session retention.
+- **Resilient Recovery**: Resumes interrupted scans safely, retries failed detail fetches with bounded backoff, and ensures emails are marked sent **only after** SMTP server acceptance.
+- **Conservative & Polite Scanning**: Respects target servers with configurable polite delays and a persistent Chrome profile session.
+- **First-Run Safety Gate**: An empty database never emails a flood of existing projects; the first scan refuses to run until you explicitly create a baseline.
 
 ---
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 ```mermaid
 flowchart TD
     A[Freelancermap Website] -->|Selenium / Chrome| B(BrowserSession)
     B -->|Raw Listing & Detail HTML| C(Parser Engine)
-    C -->|ProjectDiscovery & Detail| D[(SQLite Database v7)]
+    C -->|ProjectDiscovery & Detail| D[(SQLite Database v9)]
     D -->|New Pending Projects| E(Emailer Engine)
     E -->|SMTP / TLS| F[Email Recipients]
 ```
 
-- **Browser Layer (`browser.py`)**: Manages Selenium Chrome instances, persistent session profiles, cookie consent popups, infinite scroll, and readiness checks.
+- **Browser Layer (`browser.py`)**: Manages Selenium Chrome instances, persistent session profiles, cookie consent popups, verified newest-first sorting, config-driven scrolling, bounded load-more clicks, and readiness checks.
 - **Parsing Layer (`parser.py`)**: Uses BeautifulSoup and JSON-LD extractors to structure unstructured project facts with fallback chain resolution.
-- **Database Layer (`database.py`)**: Handles SQLite schema migrations, foreign keys, WAL journaling, gzip HTML compression, and CSV exports.
+- **Database Layer (`database.py`)**: Handles SQLite schema migrations, foreign keys, WAL journaling, gzip HTML compression, provenance tracking, and CSV exports.
 - **Alerting Layer (`emailer.py`)**: Formats multipart plain-text and HTML email digests with recipient verification and Message-ID tracking.
 - **Orchestration Layer (`monitor.py` & `main.py`)**: Executes single-process cycles protected by non-blocking file locks.
 
 ---
 
-## 📊 Extracted & Persisted Schema
+## Dual-Feed Configuration
+
+Freelancermap offers two sort modes, verified against the live site:
+
+| `sort` value | Meaning |
+| :--- | :--- |
+| `sort=1` | **Newest projects first** |
+| `sort=2` | **Relevant first** |
+
+- `FREELANCERMAP_PRIMARY_SEARCH_URL` — the newest-first feed (the monitor **refuses to run** unless this URL contains `sort=1`). The monitor also verifies the rendered sort state in the DOM before scanning and rejects a page that is not sorted newest-first.
+- `FREELANCERMAP_PERSONALIZED_SEARCH_URL` — an optional second feed (`sort=1` or `sort=2`). `ENABLE_PERSONALIZED_FEED=true` enables scanning it; projects already known from the primary feed are enriched with any richer data from this feed.
+
+Example:
+
+```env
+FREELANCERMAP_PRIMARY_SEARCH_URL=https://www.freelancermap.com/projects?excludeDachProjects=false&query=website+development&sort=1&pagenr=1
+FREELANCERMAP_PERSONALIZED_SEARCH_URL=https://www.freelancermap.com/projects?excludeDachProjects=false&query=automation&sort=2&pagenr=1
+ENABLE_PERSONALIZED_FEED=true
+PERSONALIZED_FEED_DISCOVERY=false
+```
+
+`PERSONALIZED_FEED_DISCOVERY` controls whether projects found **only** in the secondary feed are stored at all: `false` (default) uses the secondary feed purely for enrichment of primary-feed projects; `true` also inserts secondary-only projects.
+
+Configuration validation (`python main.py --health-check`) rejects feed URLs that are missing the required sort parameter or point at login, account, dashboard, app, or project-detail routes.
+
+---
+
+## Extracted & Persisted Schema
 
 Every project record captures the following structured fields:
 
@@ -57,9 +87,19 @@ Every project record captures the following structured fields:
 | **`workload`** | Expected capacity | `"Full-time"`, `"80%"` |
 | **`posted_at`** | Verified posting UTC timestamp | `"2026-07-30T23:38:00+00:00"` |
 
+Feed provenance (schema 9):
+
+| Field Name | Description |
+| :--- | :--- |
+| **`seen_in_primary`** | Row was seen in the primary (newest-first) feed |
+| **`seen_in_personalized`** | Row was seen in the secondary feed |
+| **`primary_position`** | First-seen position in the primary feed |
+| **`personalized_position`** | First-seen position in the secondary feed |
+| **`discovery_sources_json`** | Accumulated source labels (e.g. `["primary_newest", "personalized_relevant"]`) |
+
 ---
 
-## 🛠️ Quick Start & Windows Setup
+## Quick Start & Windows Setup
 
 ### 1. Prerequisites
 - **Python 3.10+**
@@ -72,40 +112,38 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 ### 3. Environment Configuration
-Copy `.env.example` to `.env` and fill in your SMTP details:
-```env
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USERNAME=your-email@gmail.com
-SMTP_PASSWORD=your-app-password
-SMTP_TO_EMAILS=hafiz.muhammad.ibrahim.salman@gmail.com
+Copy `.env.example` to `.env` and fill in your SMTP details and feed URLs (see "Dual-Feed Configuration" above).
+
+### 4. First Run (mandatory order)
+
+```powershell
+# 1. Log in once in a visible browser; the session is saved under data/chrome_profile
+python main.py --interactive-login --visible
+
+# 2. Create the baseline: stores existing projects WITHOUT emailing them
+python main.py --initialize-baseline --visible
 ```
 
-### 4. Running the Monitor
+Without step 2, the first unattended run **refuses to scan**:
 
-#### Continuous Background Monitor (Default: 600s interval)
-```powershell
-python main.py
+```
+RuntimeError: Baseline is not initialized. Run: python main.py --initialize-baseline --visible
 ```
 
-#### Run One Single Cycle
-```powershell
-python main.py --run-once
-```
+### 5. Running the Monitor
 
-#### Manual Baseline Initialization (Store existing projects without emailing)
 ```powershell
-python main.py --initialize-baseline
+python main.py                                # continuous monitor (600s default interval)
+python main.py --run-once                     # one single cycle
+python main.py --run-once --visible           # one cycle with a visible browser
 ```
 
 ---
 
-## ⚙️ CLI Reference
-
-The CLI support multiple diagnostic, administrative, and inspection options:
+## CLI Reference
 
 ```bash
-# Check runtime health, database version, and SMTP configuration
+# Check runtime health, database version, and configuration validation
 python main.py --health-check
 
 # Display SQLite row counts, integrity check, and foreign key status
@@ -122,16 +160,37 @@ python main.py --export-csv data/freelancermap_projects.csv
 
 # Run in dry-run mode (scans and stores projects without sending emails)
 python main.py --dry-run --run-once
+
+# Log in once in a visible browser and persist the authenticated session
+python main.py --interactive-login --visible
+
+# Create the baseline (stores existing projects without emailing them)
+python main.py --initialize-baseline --visible
+
+# Validate the browser, session, and listing load end-to-end
+python main.py --test-browser --visible
+
+# Print the resolved primary/personalized feed URLs and feature toggles
+python main.py --show-search-configuration
 ```
 
 ---
 
-## 🧪 Testing & Reliability Engineering
+## Browser & Chrome Options
+
+- The monitor uses a **persistent profile** (`data/chrome_profile`, `--profile-directory` support) so login state survives across runs.
+- A cross-process profile lock prevents two monitor instances from sharing the same Chrome profile; the lock is released even when Chrome fails to start.
+- No automation-masking flags and no spoofed user agent are used — the monitor presents itself as a normal Chrome browser.
+- `--no-sandbox` / `--disable-dev-shm-usage` are **opt-in** via `CHROME_NO_SANDBOX=true` for constrained Linux/container deployments only.
+
+---
+
+## Testing & Reliability Engineering
 
 The repository includes a comprehensive, 100% green test suite:
 
 ```bash
-# Run complete test suite (120 tests passing)
+# Run complete test suite (172 tests passing)
 python -m unittest discover -s tests -v
 
 # Run property-based 1,000-input fuzz testing
@@ -144,21 +203,22 @@ python -m unittest tests/test_adversarial_parser.py
 python smoke_test.py
 ```
 
-- **120 Unit Tests**: 100% passing rate across database, emailer, parser, browser, and monitor modules.
+- **172 Unit Tests**: 100% passing rate across database, emailer, parser, browser, and monitor modules — including dual-feed merge/precedence/provenance, authentication gating, baseline safety, sort enforcement, pagination loops, and profile-lock cleanup.
 - **Fuzz Testing**: 1,000 randomized malformed HTML inputs verifying 8 critical invariants.
 - **Adversarial Suite**: 22 edge-case tests protecting against prose label pollution, split DOM nodes, and hidden modals.
 
 ---
 
-## 🔒 Safety & Ethical Guidelines
+## Safety & Ethical Guidelines
 
 - **No Bypass Mechanics**: Does not bypass CAPTCHA, MFA, rate limits, authentication, or access controls.
 - **Interactive Login**: Supports manual authentication via `--interactive-login` to safely save sessions under `data/chrome_profile`.
 - **Conservative Politeness**: Employs randomized delay intervals (`4s - 8s`) between detail page requests to ensure minimal server footprint.
+- **Credentials**: `FREELANCERMAP_LOGIN_EMAIL` / `FREELANCERMAP_LOGIN_PASSWORD` are read from `.env` (gitignored) only; prefer interactive login to avoid storing the password in plaintext.
 
 ---
 
-## 📜 License & Disclaimer
+## License & Disclaimer
 
 Distributed under the **MIT License**. See `LICENSE` for details.  
 *Disclaimer*: This software is for personal monitoring use. Always adhere to Freelancermap's terms of service and acceptable use policies.

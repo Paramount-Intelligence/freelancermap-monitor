@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from browser import (
     BrowserNavigationError,
     BrowserSession,
+    HttpError,
     PageState,
     _is_login_url,
 )
 from config import Config
+from utils import exclusive_file_lock
 
 
 class FakeElement:
@@ -81,6 +85,9 @@ class FakeDriver:
         if "scrollHeight" in script and "Math.max" in script:
             return self.height
         return None
+
+    def get(self, url: str) -> None:
+        self.current_url = url
 
     def find_elements(self, by: str, value: str):
         return list(self.elements.get((by, value), []))
@@ -247,6 +254,79 @@ class BrowserSessionEnhancedTests(unittest.TestCase):
         session.close()
         self.assertTrue(driver.quit_called)
         self.assertIsNone(session.driver)
+
+    def test_sort_state_read_from_checked_radio(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        session = BrowserSession(headless=True)
+        session.driver = FakeDriver(  # type: ignore[assignment]
+            elements={
+                (By.CSS_SELECTOR, "input[name='sort-option']:checked"): [
+                    FakeElement(attributes={"value": "2"})
+                ]
+            }
+        )
+        self.assertEqual(session._current_sort_state(), "2")
+
+    def test_listing_page_rejects_mismatched_sort_state(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        session = BrowserSession(headless=True)
+        session.driver = FakeDriver(  # type: ignore[assignment]
+            elements={
+                (By.CSS_SELECTOR, "input[name='sort-option']:checked"): [
+                    FakeElement(attributes={"value": "2"})
+                ]
+            }
+        )
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):
+            with self.assertRaises(HttpError):
+                session.load_listing_page(
+                    "https://www.freelancermap.com/projects?sort=1",
+                    expected_sort="1",
+                )
+
+    def test_listing_page_accepts_newest_sort_state(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        session = BrowserSession(headless=True)
+        session.driver = FakeDriver(  # type: ignore[assignment]
+            elements={
+                (By.CSS_SELECTOR, "input[name='sort-option']:checked"): [
+                    FakeElement(attributes={"value": "1"})
+                ]
+            }
+        )
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):
+            html = session.load_listing_page(
+                "https://www.freelancermap.com/projects?sort=1",
+                expected_sort="1",
+            )
+        self.assertIn("Projects available", html)
+
+    def test_listing_page_skips_sort_check_when_state_unverifiable(self) -> None:
+        session = BrowserSession(headless=True)
+        session.driver = FakeDriver()  # type: ignore[assignment]
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):
+            html = session.load_listing_page(
+                "https://www.freelancermap.com/projects?sort=1",
+                expected_sort="1",
+            )
+        self.assertIn("Projects available", html)
+
+    def test_profile_lock_released_when_chrome_startup_fails(self) -> None:
+        self.driver_patch.stop()
+        self.addCleanup(self.driver_patch.start)
+        with tempfile.TemporaryDirectory() as folder:
+            profile = Path(folder) / "chrome_profile"
+            with patch.object(Config, "CHROME_PROFILE_DIR", profile), \
+                 patch("browser.webdriver.Chrome", side_effect=RuntimeError("chrome exploded")):
+                with self.assertRaises(RuntimeError):
+                    BrowserSession(headless=True)
+            lock_file = profile.parent / "chrome_profile.lock"
+            self.assertTrue(lock_file.exists())
+            with exclusive_file_lock(lock_file, timeout_seconds=0.5):
+                pass
 
 
 if __name__ == "__main__":

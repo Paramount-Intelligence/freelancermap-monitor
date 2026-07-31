@@ -765,9 +765,28 @@ def baseline_initialized() -> bool:
     return get_setting("baseline_initialized", "false").strip().casefold() == "true"
 
 
+def _parse_sources_json(raw: str) -> list[str]:
+    """Parse a persisted discovery_sources_json value, tolerating corrupt rows."""
+    if not raw or not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
 def upsert_discovery(
-    project: ProjectDiscovery,
+    project: Any,
+    *,
     baseline: bool = False,
+    seen_in_primary: bool = True,
+    seen_in_personalized: bool = False,
+    primary_position: int | None = None,
+    personalized_position: int | None = None,
+    discovery_sources: list[str] | None = None,
 ) -> tuple[int, bool]:
     """Insert or refresh one listing-card discovery atomically.
 
@@ -784,6 +803,11 @@ def upsert_discovery(
     source_key = str(getattr(project, "source_key", "") or "").strip()
     url = str(getattr(project, "url", "") or "").strip()
     slug = str(getattr(project, "slug", "") or source_key).strip()
+
+    sources = discovery_sources or (["primary_newest"] if seen_in_primary else [])
+    if seen_in_personalized and "personalized_relevant" not in sources:
+        sources.append("personalized_relevant")
+    sources_json = json_dumps(sources)
     if not source_key:
         raise DatabaseInvariantError("Project discovery source_key is empty.")
     if not url:
@@ -814,6 +838,17 @@ def upsert_discovery(
             project_id = int(current["id"])
             card_hash = str(getattr(project, "card_hash", "") or "")
             changed = bool(card_hash and card_hash != str(current["card_hash"] or ""))
+
+            # Merge new discovery sources with the previously persisted ones so
+            # repeated scans across both feeds never clobber earlier provenance.
+            existing_sources = _parse_sources_json(
+                str(current["discovery_sources_json"] or "")
+            )
+            merged_sources = list(existing_sources)
+            for source in sources:
+                if source not in merged_sources:
+                    merged_sources.append(source)
+            sources_json = json_dumps(merged_sources)
 
             resolved_source_key, resolved_slug, resolved_url = _identity_update_values(
                 conn,
@@ -854,21 +889,21 @@ def upsert_discovery(
                         WHEN ? <> '' THEN ? ELSE card_posted_text END,
                     card_view_count = COALESCE(?, card_view_count),
                     card_description = CASE
-                        WHEN ? <> '' THEN ? ELSE card_description END,
+                        WHEN card_description = '' AND ? <> '' THEN ? ELSE card_description END,
                     card_description_html = CASE
-                        WHEN ? <> '' THEN ? ELSE card_description_html END,
+                        WHEN card_description_html = '' AND ? <> '' THEN ? ELSE card_description_html END,
                     card_location = CASE
-                        WHEN ? <> '' THEN ? ELSE card_location END,
+                        WHEN card_location = '' AND ? <> '' THEN ? ELSE card_location END,
                     card_workplace = CASE
-                        WHEN ? <> '' THEN ? ELSE card_workplace END,
+                        WHEN card_workplace = '' AND ? <> '' THEN ? ELSE card_workplace END,
                     card_contract_type = CASE
-                        WHEN ? <> '' THEN ? ELSE card_contract_type END,
+                        WHEN card_contract_type = '' AND ? <> '' THEN ? ELSE card_contract_type END,
                     card_duration = CASE
-                        WHEN ? <> '' THEN ? ELSE card_duration END,
+                        WHEN card_duration = '' AND ? <> '' THEN ? ELSE card_duration END,
                     card_start_date = CASE
-                        WHEN ? <> '' THEN ? ELSE card_start_date END,
+                        WHEN card_start_date = '' AND ? <> '' THEN ? ELSE card_start_date END,
                     card_workload = CASE
-                        WHEN ? <> '' THEN ? ELSE card_workload END,
+                        WHEN card_workload = '' AND ? <> '' THEN ? ELSE card_workload END,
                     card_rate = CASE WHEN ? <> '' THEN ? ELSE card_rate END,
                     card_skills_json = CASE
                         WHEN ? <> '[]' THEN ? ELSE card_skills_json END,
@@ -884,6 +919,11 @@ def upsert_discovery(
                     detail_fetch_error = CASE WHEN ? THEN '' ELSE detail_fetch_error END,
                     detail_next_retry_at = CASE
                         WHEN ? THEN NULL ELSE detail_next_retry_at END,
+                    seen_in_primary = CASE WHEN ? THEN 1 ELSE seen_in_primary END,
+                    seen_in_personalized = CASE WHEN ? THEN 1 ELSE seen_in_personalized END,
+                    primary_position = COALESCE(?, primary_position),
+                    personalized_position = COALESCE(?, personalized_position),
+                    discovery_sources_json = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -943,6 +983,11 @@ def upsert_discovery(
                     int(changed),
                     int(changed),
                     int(changed),
+                    int(seen_in_primary),
+                    int(seen_in_personalized),
+                    primary_position,
+                    personalized_position,
+                    sources_json,
                     now,
                     project_id,
                 ),
@@ -988,12 +1033,14 @@ def upsert_discovery(
                 card_rate, card_skills_json, card_text, card_hash,
                 raw_card_html_gzip, last_card_changed_at,
                 first_seen_at, last_seen_at,
-                email_status, baseline, created_at, updated_at
+                email_status, baseline, created_at, updated_at,
+                discovery_sources_json, seen_in_primary, seen_in_personalized, primary_position, personalized_position
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?
             )
             """,
             (
@@ -1042,6 +1089,11 @@ def upsert_discovery(
                 int(baseline),
                 now,
                 now,
+                sources_json,
+                int(seen_in_primary),
+                int(seen_in_personalized),
+                primary_position,
+                personalized_position,
             ),
         )
         project_id = int(cursor.lastrowid)

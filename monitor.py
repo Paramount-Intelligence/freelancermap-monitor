@@ -159,6 +159,12 @@ def _run_cycle(
         )
     )
 
+    if not result.baseline and not baseline_initialized and not bool(getattr(Config, "AUTO_BASELINE_ON_FIRST_RUN", False)):
+        raise RuntimeError(
+            "Baseline is not initialized. Run: "
+            "python main.py --initialize-baseline --visible"
+        )
+
     # Persist this state before inserting any cards. If Python, Chrome, Windows,
     # or the machine stops midway, the next run resumes baseline mode.
     if result.baseline:
@@ -203,6 +209,10 @@ def _run_cycle(
                 project_id, created = database.upsert_discovery(
                     discovery,
                     baseline=result.baseline,
+                    seen_in_primary=getattr(discovery, "_seen_in_primary", True),
+                    seen_in_personalized=getattr(discovery, "_seen_in_personalized", False),
+                    primary_position=getattr(discovery, "_primary_position", None),
+                    personalized_position=getattr(discovery, "_personalized_position", None),
                 )
                 current_project_ids.append(int(project_id))
                 result.new += int(bool(created))
@@ -323,9 +333,10 @@ def _discover(
             listing_url,
             scan_at=scan_at,
             page_number=page_number,
+            expected_sort=str(getattr(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1")),
         )
 
-        for project in projects:
+        for pos, project in enumerate(projects, 1):
             try:
                 _validate_discovery(project)
             except Exception as exc:
@@ -335,13 +346,19 @@ def _discover(
                 )
                 continue
 
+            setattr(project, "_seen_in_primary", True)
+            if not hasattr(project, "_primary_position"):
+                setattr(project, "_primary_position", pos)
+
             key = canonicalize_url(project.url, Config.BASE_URL)
             existing = by_url.get(key)
-            by_url[key] = (
-                _richer_discovery(existing, project)
-                if existing is not None
-                else project
-            )
+            if existing is not None:
+                merged = _richer_discovery(existing, project)
+                setattr(merged, "_seen_in_primary", True)
+                setattr(merged, "_primary_position", getattr(existing, "_primary_position", pos))
+                by_url[key] = merged
+            else:
+                by_url[key] = project
 
         if page_number >= max_pages:
             break
@@ -376,16 +393,24 @@ def _discover(
                 page_number=1,
             )
             ignored_count = 0
-            for sec_project in sec_projects:
+            for pos, sec_project in enumerate(sec_projects, 1):
                 try:
                     _validate_discovery(sec_project)
                 except Exception:
                     continue
+                setattr(sec_project, "_seen_in_personalized", True)
+                setattr(sec_project, "_personalized_position", pos)
                 key = canonicalize_url(sec_project.url, Config.BASE_URL)
                 if key in by_url:
                     existing = by_url[key]
-                    by_url[key] = _richer_discovery(existing, sec_project)
+                    merged = _richer_discovery(existing, sec_project)
+                    setattr(merged, "_seen_in_primary", getattr(existing, "_seen_in_primary", True))
+                    setattr(merged, "_primary_position", getattr(existing, "_primary_position", None))
+                    setattr(merged, "_seen_in_personalized", True)
+                    setattr(merged, "_personalized_position", pos)
+                    by_url[key] = merged
                 elif allow_secondary_discovery:
+                    setattr(sec_project, "_seen_in_primary", False)
                     by_url[key] = sec_project
                 else:
                     ignored_count += 1
@@ -403,6 +428,7 @@ def _load_listing_with_retries(
     *,
     scan_at: str,
     page_number: int,
+    expected_sort: str | None = None,
 ) -> list[ProjectDiscovery]:
     retries = max(0, int(getattr(Config, "EMPTY_RESULT_RETRIES", 2)))
     retry_delay = max(0.0, float(getattr(Config, "EMPTY_RESULT_RETRY_SECONDS", 15.0)))
@@ -411,7 +437,10 @@ def _load_listing_with_retries(
 
     for attempt in range(1, attempts + 1):
         try:
-            html = browser.load_listing_page(url)
+            html = browser.load_listing_page(
+                url,
+                expected_sort=expected_sort,
+            )
             projects = _parse_listing(html, scan_at)
             dom_count = _browser_project_route_count(browser)
             _validate_parser_coverage(

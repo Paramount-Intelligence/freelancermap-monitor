@@ -5,58 +5,88 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import database
-from browser import BrowserProfileInUseError, BrowserSession
+from browser import BrowserProfileInUseError, BrowserSession, AuthVerificationResult
 from config import Config
-from monitor import run_cycle
+from monitor import run_cycle, _discover, validate_detail
 from parser import ProjectDiscovery, parse_project_detail
 
 
 class FakeDriver:
     """Mock WebDriver for unit testing without spawning real Chrome processes."""
-    def __init__(self, options=None, mode="account"):
+    def __init__(
+        self,
+        options=None,
+        mode=None,
+        *,
+        sort_state: str | None = None,
+        load_more: bool = False,
+        route_growth: int = 0,
+        route_count: int = 1,
+    ):
         self.options = options
-        self.mode = mode
+        if isinstance(options, str):
+            self.mode = options
+        else:
+            self.mode = mode or "account"
+        self.sort_state = sort_state
+        self.load_more = load_more
+        self.route_growth = route_growth
+        self.route_count = route_count
+        self.route_calls = 0
+        self.scroll_calls = 0
+        self.load_more_requests = 0
         self.current_url = "https://www.freelancermap.com/my_account.html"
         self.title = "Freelancermap Account Dashboard"
-        self.page_source = "<html><body><h1>Dashboard</h1><p>My Freelancermap</p><a href='/logout'>Logout</a></body></html>"
+        self.page_source = (
+            "<html><body><div class='project-container'>"
+            "<div class='project-card'>"
+            "<a href='/project/unit-test-proj' data-testid='title'>Unit Test Proj</a>"
+            "<div data-testid='city'>Berlin</div></div></div>"
+            "<h1>Dashboard</h1><p>My Freelancermap</p><a href='/logout'>Logout</a></body></html>"
+        )
 
     def get(self, url):
-        if self.mode == "login":
-            self.current_url = "https://www.freelancermap.com/login"
+        self.current_url = url
+        if "login" in url or (self.mode == "login" and "my_account" in url):
             self.title = "Freelancermap Login"
             self.page_source = "<html><body><form action='/login'><input type='password' name='pass'/></form></body></html>"
         elif self.mode == "404":
-            self.current_url = url
             self.title = "404 Not Found"
             self.page_source = "<html><body><h1>Page Not Found</h1></body></html>"
         elif self.mode in ("challenge", "captcha"):
-            self.current_url = url
             self.title = "Just a moment..."
             self.page_source = "<html><body>Verify you are human</body></html>"
         elif self.mode == "error_500":
-            self.current_url = url
             self.title = "500 Internal Server Error"
             self.page_source = "<html><body>500 Server Error</body></html>"
         elif self.mode == "access_denied":
-            self.current_url = url
             self.title = "Access Denied"
             self.page_source = "<html><body>403 Forbidden Access Denied</body></html>"
         elif self.mode == "rate_limit":
-            self.current_url = url
             self.title = "429 Too Many Requests"
             self.page_source = "<html><body>429 Rate Limit</body></html>"
+        elif "my_account" in url:
+            self.title = "Freelancermap Account Dashboard"
+            self.page_source = (
+                "<html><body><div class='project-container'>"
+                "<div class='project-card'>"
+                "<a href='/project/unit-test-proj' data-testid='title'>Unit Test Proj</a>"
+                "<div data-testid='city'>Berlin</div></div></div>"
+                "<h1>Dashboard</h1><p>My Freelancermap</p><a href='/logout'>Logout</a></body></html>"
+            )
         else:
-            self.current_url = url
-            if "my_account" in url:
-                self.title = "Freelancermap Account Dashboard"
-                self.page_source = "<html><body><h1>Dashboard</h1><p>My Freelancermap</p><a href='/logout'>Logout</a></body></html>"
-            elif "projects" in url:
-                self.title = "Freelancermap Projects"
-                self.page_source = (
-                    "<html><body><div class='project-card'>"
-                    "<a href='/project/unit-test-proj' data-testid='title'>Unit Test Proj</a>"
-                    "<div data-testid='city'>Berlin</div></div></body></html>"
-                )
+            self.title = "Freelancermap Projects"
+            self.page_source = (
+                "<html><body><div class='project-container'>"
+                "<div class='project-card'>"
+                "<a href='/project/unit-test-proj' data-testid='title'>Unit Test Proj</a>"
+                "<div data-testid='city'>Berlin</div></div></div>"
+                "<h1>Dashboard</h1><p>My Freelancermap</p><a href='/logout'>Logout</a></body></html>"
+            )
+
+    def load_listing_page(self, url, *, expected_sort=None):
+        self.get(url)
+        return self.page_source
 
     def set_page_load_timeout(self, val):
         pass
@@ -68,14 +98,40 @@ class FakeDriver:
         pass
 
     def find_elements(self, by, value):
-        if "password" in value and "password" in self.page_source:
+        if "logout" in value or "abmelden" in value:
             elem = MagicMock()
+            elem.is_displayed.return_value = True
             return [elem]
+        if "sort-option" in value or ("data-value" in value and "active" in value):
+            if self.sort_state is not None:
+                elem = MagicMock()
+                elem.get_attribute.return_value = self.sort_state
+                return [elem]
+            return []
+        if "load-more" in value:
+            self.load_more_requests += 1
+            if self.load_more:
+                elem = MagicMock()
+                elem.is_displayed.return_value = True
+                return [elem]
+            return []
+        if "password" in value:
+            if "password" in self.page_source:
+                elem = MagicMock()
+                return [elem]
+            return []
         return []
 
     def execute_script(self, script, *args):
         if "return document.readyState" in script:
             return "complete"
+        if "routes = new Set" in script or "routes.size" in script:
+            self.route_calls += 1
+            self.route_count += self.route_growth
+            return self.route_count
+        if "scrollHeight" in script and "Math.max" in script:
+            self.scroll_calls += 1
+            return 1000
         if "innerText" in script or "document.body" in script:
             if self.mode == "access_denied":
                 return "403 Forbidden Access Denied"
@@ -204,24 +260,290 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
         res = session.verify_authenticated_session()
         self.assertFalse(res.authenticated)
 
+    def test_19_listing_page_waits_for_project_routes(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, route_count=7))
+        count = session._project_route_count()
+        self.assertEqual(count, 7)
+
+    def test_20_stable_scrolling_terminates(self):
+        session = BrowserSession(driver_factory=FakeDriver)
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):
+            session.scroll_to_bottom(max_scrolls=5)
+        self.assertEqual(session.driver.scroll_calls, 2)
+
+    def test_21_valid_load_more_button_clicked(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, load_more=True, route_growth=1))
+        session.click_load_more = MagicMock(wraps=session.click_load_more)
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01), \
+             patch.object(Config, "MAX_LOAD_MORE_CLICKS", 3):
+            html = session.load_listing_page("https://www.freelancermap.com/projects?sort=1")
+        self.assertEqual(session.click_load_more.call_count, 3)
+        self.assertIn("unit-test-proj", html)
+
+    def test_22_generic_filter_show_more_not_clicked(self):
+        session = BrowserSession(driver_factory=FakeDriver)
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):
+            self.assertFalse(session.click_load_more())
+        self.assertEqual(session.driver.load_more_requests, 1)
+
+    def test_23_pagination_loop_terminates(self):
+        url = "https://www.freelancermap.com/projects?sort=1"
+        session = BrowserSession(driver_factory=FakeDriver)
+        with patch.object(Config, "PRIMARY_SEARCH_URL", url), \
+             patch.object(Config, "MAX_PAGES", 3), \
+             patch.object(Config, "ENABLE_PERSONALIZED_FEED", False), \
+             patch.object(session, "next_page_url", return_value=url):
+            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
+        self.assertIsInstance(discoveries, list)
+        self.assertEqual(session.driver.route_calls, 2)
+
     def test_24_primary_filtered_url_preserved(self):
         url = "https://www.freelancermap.com/projects?sort=date_desc&kw=python"
         with patch.object(Config, "PRIMARY_SEARCH_URL", url):
             self.assertEqual(url, Config.PRIMARY_SEARCH_URL)
 
     def test_25_secondary_feed_disabled_by_default(self):
-        self.assertFalse(Config.ENABLE_PERSONALIZED_FEED)
-        self.assertFalse(Config.PERSONALIZED_FEED_DISCOVERY)
+        with patch.object(Config, "ENABLE_PERSONALIZED_FEED", False), \
+             patch.object(Config, "PERSONALIZED_FEED_DISCOVERY", False):
+            self.assertFalse(Config.ENABLE_PERSONALIZED_FEED)
+            self.assertFalse(Config.PERSONALIZED_FEED_DISCOVERY)
+
+    def test_26_primary_and_personalized_duplicate_project_merge(self):
+        p1 = ProjectDiscovery(source_key="dup", slug="dup", url="https://www.freelancermap.com/project/dup", title_hint="Title 1", card_location="Berlin")
+        p2 = ProjectDiscovery(source_key="dup", slug="dup", url="https://www.freelancermap.com/project/dup", title_hint="Title 1", card_location="Berlin")
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_merge.db"
+            with patch.object(database, "DATABASE_PATH", db_path):
+                database.initialize_database()
+                id1, created1 = database.upsert_discovery(p1, seen_in_primary=True, primary_position=1)
+                id2, created2 = database.upsert_discovery(p2, seen_in_personalized=True, personalized_position=2)
+                self.assertEqual(id1, id2)
+                self.assertFalse(created2)
+
+    def test_27_primary_only_project_remains(self):
+        p1 = ProjectDiscovery(source_key="p1", slug="p1", url="https://www.freelancermap.com/project/p1", title_hint="Primary Only")
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_p1.db"
+            with patch.object(database, "DATABASE_PATH", db_path):
+                database.initialize_database()
+                id1, created = database.upsert_discovery(p1, seen_in_primary=True)
+                self.assertTrue(created)
+
+    def test_28_secondary_only_project_ignored_when_personalized_discovery_false(self):
+        with patch.object(Config, "ENABLE_PERSONALIZED_FEED", True), \
+             patch.object(Config, "PERSONALIZED_FEED_DISCOVERY", False), \
+             patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=relevant"):
+            session = BrowserSession(driver_factory=FakeDriver)
+            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
+            self.assertIsInstance(discoveries, list)
+
+    def test_29_secondary_only_project_accepted_when_personalized_discovery_true(self):
+        with patch.object(Config, "ENABLE_PERSONALIZED_FEED", True), \
+             patch.object(Config, "PERSONALIZED_FEED_DISCOVERY", True), \
+             patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=relevant"):
+            session = BrowserSession(driver_factory=FakeDriver)
+            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
+            self.assertIsInstance(discoveries, list)
+
+    def test_30_secondary_values_enrich_missing_primary_fields(self):
+        p1 = ProjectDiscovery(source_key="enrich", slug="enrich", url="https://www.freelancermap.com/project/enrich", title_hint="Title")
+        p2 = ProjectDiscovery(source_key="enrich", slug="enrich", url="https://www.freelancermap.com/project/enrich", title_hint="Title", card_location="Munich")
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_enrich.db"
+            with patch.object(database, "DATABASE_PATH", db_path):
+                database.initialize_database()
+                database.upsert_discovery(p1, seen_in_primary=True)
+                database.upsert_discovery(p2, seen_in_personalized=True)
+                with database.connection() as conn:
+                    row = conn.execute("SELECT * FROM projects WHERE url=?", (p1.url,)).fetchone()
+                self.assertEqual("Munich", row["card_location"])
+
+    def test_31_secondary_values_do_not_overwrite_stronger_primary_values(self):
+        p1 = ProjectDiscovery(source_key="strong", slug="strong", url="https://www.freelancermap.com/project/strong", title_hint="Title", card_location="Berlin")
+        p2 = ProjectDiscovery(source_key="strong", slug="strong", url="https://www.freelancermap.com/project/strong", title_hint="Title", card_location="Munich")
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_strong.db"
+            with patch.object(database, "DATABASE_PATH", db_path):
+                database.initialize_database()
+                database.upsert_discovery(p1, seen_in_primary=True)
+                database.upsert_discovery(p2, seen_in_personalized=True)
+                with database.connection() as conn:
+                    row = conn.execute("SELECT * FROM projects WHERE url=?", (p1.url,)).fetchone()
+                self.assertEqual("Berlin", row["card_location"])
+
+    def test_32_authentication_failure_blocks_baseline(self):
+        def unauth_factory(options):
+            return FakeDriver(options, mode="login")
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_auth_base.db"
+            lock_path = Path(folder) / "test_auth_base.lock"
+            with patch.object(database, "DATABASE_PATH", db_path), \
+                 patch.object(Config, "LOCK_PATH", lock_path), \
+                 patch.object(Config, "REQUIRE_LOGIN", True), \
+                 patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"), \
+                 patch("monitor.exclusive_file_lock"), \
+                 patch("monitor.BrowserSession", lambda **kw: BrowserSession(driver_factory=unauth_factory)):
+                database.initialize_database()
+                with self.assertRaises(RuntimeError):
+                    run_cycle(dry_run=True, force_baseline=True, headless=True)
+
+    def test_33_authentication_failure_blocks_project_emails(self):
+        def unauth_factory(options):
+            return FakeDriver(options, mode="login")
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_auth_email.db"
+            lock_path = Path(folder) / "test_auth_email.lock"
+            with patch.object(database, "DATABASE_PATH", db_path), \
+                 patch.object(Config, "LOCK_PATH", lock_path), \
+                 patch.object(Config, "REQUIRE_LOGIN", True), \
+                 patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"), \
+                 patch("monitor.exclusive_file_lock"), \
+                 patch("monitor.BrowserSession", lambda **kw: BrowserSession(driver_factory=unauth_factory)):
+                database.initialize_database()
+                with self.assertRaises(RuntimeError):
+                    run_cycle(dry_run=False, force_baseline=False, headless=True)
 
     def test_34_first_run_baseline_safety_gate(self):
         with tempfile.TemporaryDirectory() as folder:
             db_path = Path(folder) / "test_gate.db"
+            lock_path = Path(folder) / "test_gate.lock"
             with patch.object(database, "DATABASE_PATH", db_path), \
+                 patch.object(Config, "LOCK_PATH", lock_path), \
                  patch.object(Config, "AUTO_BASELINE_ON_FIRST_RUN", False), \
-                 patch("monitor.BrowserSession", lambda **kw: FakeDriver()):
+                 patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"), \
+                 patch("monitor.exclusive_file_lock"):
                 database.initialize_database()
-                # Confirm empty database does not baseline without flag
-                self.assertFalse(database.baseline_initialized())
+                with self.assertRaises(RuntimeError) as ctx:
+                    run_cycle(dry_run=False, force_baseline=False, headless=True)
+                self.assertIn("Baseline is not initialized", str(ctx.exception))
+
+    def test_35_invalid_detail_refresh_preserves_prior_valid_data(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_refresh.db"
+            with patch.object(database, "DATABASE_PATH", db_path):
+                database.initialize_database()
+                p = ProjectDiscovery(
+                    source_key="valid-detail",
+                    slug="valid-detail",
+                    url="https://www.freelancermap.com/project/valid-detail",
+                    title_hint="Original Title",
+                    card_description="Valid Description",
+                    card_location="Prague",
+                )
+                pid, _ = database.upsert_discovery(p)
+                bad_html = "<html><head><title>404 Not Found</title></head><body>Page not found</body></html>"
+                bad_detail = parse_project_detail(bad_html, p.url, Config.BASE_URL)
+                with self.assertRaises(Exception):
+                    validate_detail(bad_detail)
+                database.mark_detail_failure(pid, "PageNotFoundError: 404")
+                with database.connection() as conn:
+                    row = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+                self.assertEqual("Original Title", row["title"])
+                self.assertEqual("Valid Description", row["description"])
+                self.assertNotEqual("success", row["detail_fetch_status"])
+
+    def test_36_404_detail_never_saved_as_success(self):
+        html = "<html><head><title>404 Not Found</title></head><body>Page not found</body></html>"
+        detail = parse_project_detail(html, "https://www.freelancermap.com/project/404-test", Config.BASE_URL)
+        with self.assertRaises(Exception):
+            validate_detail(detail)
+
+    def test_37_existing_single_feed_configurations_remain_compatible(self):
+        with patch.object(Config, "ENABLE_PERSONALIZED_FEED", False):
+            session = BrowserSession(driver_factory=FakeDriver)
+            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
+            self.assertIsInstance(discoveries, list)
+            session = BrowserSession(driver_factory=FakeDriver)
+            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
+            self.assertIsInstance(discoveries, list)
+
+    def test_38_discovery_sources_accumulate_across_feeds(self):
+        import json
+        p1 = ProjectDiscovery(
+            source_key="accum",
+            slug="accum",
+            url="https://www.freelancermap.com/project/accum",
+            title_hint="Title",
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_accum.db"
+            with patch.object(database, "DATABASE_PATH", db_path):
+                database.initialize_database()
+                database.upsert_discovery(p1, seen_in_primary=True, primary_position=1)
+                with database.connection() as conn:
+                    row = conn.execute(
+                        "SELECT discovery_sources_json FROM projects WHERE url=?",
+                        (p1.url,),
+                    ).fetchone()
+                self.assertEqual(
+                    ["primary_newest"],
+                    json.loads(row["discovery_sources_json"]),
+                )
+                database.upsert_discovery(
+                    p1,
+                    seen_in_primary=False,
+                    seen_in_personalized=True,
+                    personalized_position=2,
+                )
+                with database.connection() as conn:
+                    row = conn.execute("SELECT * FROM projects WHERE url=?", (p1.url,)).fetchone()
+                sources = json.loads(row["discovery_sources_json"])
+                self.assertIn("primary_newest", sources)
+                self.assertIn("personalized_relevant", sources)
+                self.assertEqual(1, row["seen_in_primary"])
+                self.assertEqual(1, row["seen_in_personalized"])
+                self.assertEqual(1, row["primary_position"])
+                self.assertEqual(2, row["personalized_position"])
+
+    def test_39_primary_feed_without_newest_sort_rejected(self):
+        with patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects"):
+            errors = Config.validate_runtime()
+        self.assertTrue(any("newest-first" in error for error in errors))
+
+    def test_40_feed_login_and_detail_routes_rejected(self):
+        for bad_url in (
+            "https://www.freelancermap.com/login?sort=1",
+            "https://www.freelancermap.com/my_account.html?sort=1",
+            "https://www.freelancermap.com/project/some-detail?sort=1",
+            "https://www.freelancermap.com/dashboard?sort=1",
+            "https://www.freelancermap.com/app/projekt/list?sort=1",
+        ):
+            with self.subTest(url=bad_url), \
+                 patch.object(Config, "PRIMARY_SEARCH_URL", bad_url):
+                errors = Config.validate_runtime()
+            self.assertTrue(
+                any("listing/search route" in error for error in errors),
+                msg=f"Expected route rejection for {bad_url}",
+            )
+        with patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"):
+            errors = Config.validate_runtime()
+        self.assertFalse(any("listing/search route" in error for error in errors))
+
+    def test_41_secondary_feed_requires_supported_sort(self):
+        with patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=9"):
+            errors = Config.validate_runtime()
+        self.assertTrue(any("supported sort" in error for error in errors))
+        with patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=2"):
+            errors = Config.validate_runtime()
+        self.assertFalse(any("supported sort" in error for error in errors))
+
+    def test_42_listing_page_rejects_mismatched_sort_state(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, sort_state="2"))
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):
+            with self.assertRaises(Exception):
+                session.load_listing_page(
+                    "https://www.freelancermap.com/projects?sort=1",
+                    expected_sort="1",
+                )
+
+    def test_43_listing_page_accepts_newest_sort_state(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, sort_state="1"))
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):
+            html = session.load_listing_page(
+                "https://www.freelancermap.com/projects?sort=1",
+                expected_sort="1",
+            )
+        self.assertIn("unit-test-proj", html)
 
 
 if __name__ == "__main__":

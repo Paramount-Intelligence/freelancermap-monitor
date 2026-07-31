@@ -127,6 +127,10 @@ class ProjectDiscovery:
     card_hash: str = ""
     scan_at: str = ""
     posted_at: str = ""
+    _seen_in_primary: bool = True
+    _seen_in_personalized: bool = False
+    _primary_position: int | None = None
+    _personalized_position: int | None = None
 
     def finalize(self) -> "ProjectDiscovery":
         self.scan_at = _normalize_scan_at(self.scan_at)

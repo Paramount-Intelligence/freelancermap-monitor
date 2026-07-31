@@ -145,11 +145,10 @@ class BrowserSession:
         options = Options()
         if self.headless:
             options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
+        if bool(getattr(Config, "CHROME_NO_SANDBOX", False)):
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1920,1080")
-        options.add_argument("--disable-blink-features=AutomationControlled")
         
         # Configure persistent Chrome profile directory and profile name
         if profile_dir:
@@ -160,14 +159,19 @@ class BrowserSession:
             if profile_name:
                 options.add_argument(f"--profile-directory={profile_name}")
 
-        options.add_argument(
-            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        if self.driver_factory:
-            self.driver = self.driver_factory(options)
-        else:
-            self.driver = webdriver.Chrome(options=options)
+        try:
+            if self.driver_factory:
+                self.driver = self.driver_factory(options)
+            else:
+                self.driver = webdriver.Chrome(options=options)
+        except Exception:
+            if self._profile_lock_context is not None:
+                try:
+                    self._profile_lock_context.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._profile_lock_context = None
+            raise
         
         page_load_timeout = getattr(Config, "PAGE_LOAD_TIMEOUT", 30)
         script_timeout = getattr(Config, "SCRIPT_TIMEOUT_SECONDS", 15)
@@ -415,13 +419,76 @@ class BrowserSession:
             
         return self.get_page_source()
 
-    def load_listing_page(self, url: str) -> str:
-        """Navigate to a listing page, handle cookies, scroll, and return page source HTML."""
+    def _current_sort_state(self) -> str | None:
+        """Read the active sort value from the listing DOM, if present.
+
+        Freelancermap renders the sort state as a checked radio
+        (``input[name='sort-option']:checked``) and an active dropdown entry
+        (``li[data-value].active``). A missing control yields None and must not
+        be treated as proof of any particular sort.
+        """
+        try:
+            radios = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "input[name='sort-option']:checked",
+            )
+            for radio in radios:
+                value = radio.get_attribute("value")
+                if value:
+                    return value
+            active = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "li[data-value].active, [role='button'][data-value].active",
+            )
+            for element in active:
+                value = element.get_attribute("data-value")
+                if value:
+                    return value
+        except Exception:
+            pass
+        return None
+
+    def _wait_for_loading_finished(self, timeout: float | None = None) -> None:
+        """Wait until no loading indicator is visible in the listing DOM."""
+        timeout = timeout or float(getattr(Config, "PAGE_LOAD_TIMEOUT", 30))
+        selectors = (
+            ".loading",
+            ".spinner",
+            ".is-loading",
+            "[aria-busy='true']",
+            ".skeleton",
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            busy = False
+            for selector in selectors:
+                try:
+                    if self.driver.find_elements(By.CSS_SELECTOR, selector):
+                        busy = True
+                        break
+                except Exception:
+                    continue
+            if not busy:
+                return
+            time.sleep(0.5)
+
+    def load_listing_page(
+        self,
+        url: str,
+        *,
+        expected_sort: str | None = None,
+    ) -> str:
+        """Navigate to a listing page, verify sort state, and load dynamic content.
+
+        Scrolling uses ``Config.MAX_SCROLLS_PER_PAGE``, load-more buttons are
+        clicked at most ``Config.MAX_LOAD_MORE_CLICKS`` times, and each round
+        waits for loading indicators and a stable project-route count.
+        """
         validated = self._validated_navigation_url(url)
         self.driver.get(validated)
         self._wait_for_page_load()
         self.accept_cookie_banner()
-        
+
         state = self._page_state()
         if state.error_detected:
             title = (self.driver.title or "").strip()
@@ -429,19 +496,33 @@ class BrowserSession:
                 raise PageNotFoundError(f"Listing page {url} returned 404/Error: '{title}'")
             raise HttpError(f"Listing page {url} returned error state: '{title}'")
 
-        # Scroll to load dynamic content and cards
-        self.scroll_to_bottom(max_scrolls=2)
-        
-        # Click 'load more' if available
-        try:
-            load_more = self.driver.find_elements(By.CSS_SELECTOR, "button[class*='load-more'], a[class*='load-more'], button[data-testid='load-more']")
-            for btn in load_more:
-                if btn.is_displayed():
-                    btn.click()
-                    time.sleep(1.0)
+        if expected_sort is not None:
+            actual_sort = self._current_sort_state()
+            if actual_sort is not None and actual_sort != expected_sort:
+                raise HttpError(
+                    f"Listing page {url} is sorted {actual_sort!r}, expected "
+                    f"newest-first (sort={expected_sort}). Refusing to scan a "
+                    "differently sorted feed."
+                )
+
+        # Scroll to load lazy content using the configured per-page scroll cap.
+        max_scrolls = int(getattr(Config, "MAX_SCROLLS_PER_PAGE", 6))
+        if max_scrolls > 0:
+            self.scroll_to_bottom(max_scrolls=max_scrolls)
+
+        # Click 'load more' repeatedly, waiting for content to stabilise.
+        max_clicks = int(getattr(Config, "MAX_LOAD_MORE_CLICKS", 3))
+        if max_clicks > 0:
+            for _ in range(max_clicks):
+                before = self._project_route_count()
+                if not self.click_load_more():
                     break
-        except Exception:
-            pass
+                self._wait_for_loading_finished()
+                after = self._project_route_count()
+                if after <= before:
+                    break
+
+        return self.get_page_source()
 
     def verify_authenticated_session(self) -> AuthVerificationResult:
         """Navigate to ACCOUNT_URL and verify if session is authenticated."""
@@ -469,15 +550,13 @@ class BrowserSession:
             if passwords:
                 return AuthVerificationResult(authenticated=False, reason="Login password field present on page")
 
-            # Verify authenticated account markers in DOM
-            body = self._body_text()
-            if "my_account" in current or "account" in current.casefold() or "dashboard" in body.casefold() or "logout" in body.casefold() or "abmelden" in body.casefold() or "my freelancermap" in body.casefold():
-                return AuthVerificationResult(authenticated=True, reason="Authenticated account marker verified")
+            # Verify POSITIVE authenticated DOM markers (URL ALONE DOES NOT PROVE AUTHENTICATION)
+            body = self._body_text().casefold()
+            logout_elements = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='logout'], a[href*='abmelden'], [data-id='user-menu'], .user-profile, [data-testid='user-avatar']")
+            if logout_elements or "logout" in body or "abmelden" in body or "my freelancermap" in body or "account dashboard" in body:
+                return AuthVerificationResult(authenticated=True, reason="Positive authenticated DOM marker verified")
 
-            if self.is_logged_in():
-                return AuthVerificationResult(authenticated=True, reason="Session passed login checks")
-
-            return AuthVerificationResult(authenticated=False, reason="Could not verify authenticated markers on account page")
+            return AuthVerificationResult(authenticated=False, reason="Could not verify positive authenticated DOM markers on account page")
         except Exception as exc:
             return AuthVerificationResult(authenticated=False, reason=f"Authentication check failed with error: {exc}")
 
@@ -619,10 +698,35 @@ class BrowserSession:
             except Exception:
                 break
 
+    def click_load_more(self) -> bool:
+        """Click load-more button if present on listing page."""
+        if not self.driver:
+            return False
+        try:
+            buttons = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "a.btn-load-more, button.btn-load-more, .load-more-button, a[data-action='load-more']"
+            )
+            for btn in buttons:
+                if btn.is_displayed():
+                    btn.click()
+                    time.sleep(1.0)
+                    return True
+        except Exception:
+            pass
+        return False
+
     def get_page_source(self) -> str:
         """Return the current page source."""
+        if not self.driver:
+            return ""
         try:
-            return self.driver.page_source or ""
+            source = getattr(self.driver, "page_source", "")
+            if callable(source):
+                source = source()
+            if isinstance(source, (str, bytes)):
+                return source if isinstance(source, str) else source.decode("utf-8", errors="replace")
+            return ""
         except Exception:
             return ""
 

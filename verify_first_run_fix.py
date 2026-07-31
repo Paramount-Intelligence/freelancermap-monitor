@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import database
+from browser import AuthVerificationResult
 from config import Config
 from monitor import run_cycle
 
@@ -47,7 +48,7 @@ class VerificationBrowser:
     def __exit__(self, exc_type, exc, tb):
         return None
 
-    def load_listing_page(self, url):
+    def load_listing_page(self, url, *, expected_sort=None):
         return self.html_listing
 
     def load_detail_page(self, url):
@@ -62,6 +63,9 @@ class VerificationBrowser:
     def is_logged_in(self):
         return True
 
+    def verify_authenticated_session(self):
+        return AuthVerificationResult(authenticated=True, reason="Mock session authenticated")
+
 
 def verify_fix():
     print("=== VERIFYING FIRST-RUN IMMEDIATE EMAIL FIX ===")
@@ -75,6 +79,7 @@ def verify_fix():
         with patch.object(Config, "DATABASE_PATH", db_path), \
              patch.object(database, "DATABASE_PATH", db_path), \
              patch.object(Config, "LOCK_PATH", lock_path), \
+             patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"), \
              patch.object(Config, "AUTO_BASELINE_ON_FIRST_RUN", False):
             
             # Step 1: Initialize empty database
@@ -94,33 +99,46 @@ def verify_fix():
                 sent_digests.append(message)
                 return "<first-run-batch-id@freelancermap>"
 
-            # Step 2: Run cycle 1 (First Run on fresh database)
+            # Step 2: First run on a fresh database MUST be refused (safety gate)
             print("\n2. Executing First Run cycle on fresh database...")
             with patch("monitor.BrowserSession", mock_browser), \
                  patch("emailer._send", side_effect=mock_send):
-                res = run_cycle()
-                
-                print(f"   First Run Result: baseline={res.baseline}, discovered={res.discovered}, new={res.new}, emailed={res.emailed}")
+                try:
+                    run_cycle()
+                except RuntimeError as exc:
+                    print(f"   First Run refused with RuntimeError: {exc}")
+                    assert "Baseline is not initialized" in str(exc)
+                else:
+                    raise AssertionError(
+                        "First run must refuse to scan/email when the baseline "
+                        "is not initialized and AUTO_BASELINE_ON_FIRST_RUN=false."
+                    )
 
-                # ASSERTIONS FOR THE FIX:
-                assert res.baseline is False, "Baseline mode should be False on first run when AUTO_BASELINE_ON_FIRST_RUN=false!"
-                assert res.discovered == 2, f"Expected 2 discovered projects, got {res.discovered}"
-                assert res.new == 2, f"Expected 2 new projects, got {res.new}"
-                assert res.emailed == 2, f"Expected 2 emailed projects, got {res.emailed}"
-                assert len(sent_digests) == 1, "Expected 1 SMTP digest email to be sent on first run!"
+                assert len(sent_digests) == 0, "No email may be sent by a refused run!"
+                print("3. Verification successful: no projects scanned and 0 emails sent.")
 
-                print("3. Verification successful! The first run immediately emailed all 2 discovered projects.")
+            # Step 3: Explicit baseline initialization is required first
+            print("\n4. Running explicit baseline initialization...")
+            with patch("monitor.BrowserSession", mock_browser), \
+                 patch("emailer._send", side_effect=mock_send):
+                res = run_cycle(force_baseline=True)
+                assert res.baseline is True
+                assert res.discovered == 2
+                assert res.new == 2
+                assert res.emailed == 0
+                assert len(sent_digests) == 0
+                print("5. Baseline initialized with 2 projects; 0 emails sent.")
 
-            # Step 3: Inspect database rows to confirm email_status = 'sent'
-            print("\n4. Database Row Inspection:")
+            # Step 4: Inspect database rows to confirm email_status = 'baseline'
+            print("\n6. Database Row Inspection:")
             with database.connection() as conn:
                 projects = conn.execute("SELECT id, title, email_status, emailed_at FROM projects ORDER BY id").fetchall()
                 for p in projects:
                     print(f"   [ID {p['id']}] Title: '{p['title']}' | Email Status: '{p['email_status']}' | Emailed At: '{p['emailed_at']}'")
-                    assert p["email_status"] == "sent", f"Expected email_status 'sent', got '{p['email_status']}'"
-                    assert p["emailed_at"] is not None, "Expected emailed_at timestamp to be populated!"
+                    assert p["email_status"] == "baseline", f"Expected email_status 'baseline', got '{p['email_status']}'"
+                    assert p["emailed_at"] is None, "Baseline rows must never be emailed!"
 
-    print("\nFIRST-RUN IMMEDIATE EMAIL FIX IS Empirically VERIFIED & WORKING PERFECTLY!")
+    print("\nFIRST-RUN BASELINE SAFETY GATE IS EMPIRICALLY VERIFIED & WORKING!")
 
 
 if __name__ == "__main__":
