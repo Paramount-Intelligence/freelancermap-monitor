@@ -103,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     action.add_argument(
+        "--show-search-configuration",
+        action="store_true",
+        help="Print search feeds, authentication settings, and profile info",
+    )
+
+    action.add_argument(
         "--health-check",
         action="store_true",
         help="Check runtime configuration, SMTP, and SQLite health",
@@ -220,6 +226,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
             return 0
+
+        if args.show_search_configuration:
+            return show_search_configuration()
 
         database.initialize_database()
 
@@ -399,9 +408,8 @@ def test_login(
     with BrowserSession(
         headless=headless_override(visible),
     ) as browser:
-        account_url = getattr(Config, "ACCOUNT_URL", Config.BASE_URL)
-        browser.navigate(account_url)
-        success = browser.is_logged_in()
+        res = browser.verify_authenticated_session()
+        success = res.authenticated
 
     if success:
         print(
@@ -412,7 +420,7 @@ def test_login(
         return 0
 
     print(
-        "Login test failed. Run: "
+        f"Login test failed ({res.reason}). Run: "
         "python main.py --interactive-login",
         file=sys.stderr,
     )
@@ -699,6 +707,27 @@ def run_continuously(
         time.sleep(
             interval_seconds,
         )
+
+
+def show_search_configuration() -> int:
+    primary = getattr(Config, "PRIMARY_SEARCH_URL", Config.PROJECTS_URL)
+    personalized = getattr(Config, "PERSONALIZED_SEARCH_URL", "")
+    enable_sec = getattr(Config, "ENABLE_PERSONALIZED_FEED", False)
+    sec_disc = getattr(Config, "PERSONALIZED_FEED_DISCOVERY", False)
+    req_login = getattr(Config, "REQUIRE_LOGIN", True)
+    prof_dir = getattr(Config, "CHROME_PROFILE_DIR", "")
+    headless = getattr(Config, "HEADLESS", True)
+
+    print("=== FREELANCERMAP MONITOR SEARCH CONFIGURATION ===")
+    print(f"Primary Search URL       : {primary}")
+    print(f"Personalized Feed        : {'ENABLED' if enable_sec else 'DISABLED'}")
+    if enable_sec:
+        print(f"  Personalized URL       : {personalized or '(not set)'}")
+        print(f"  Secondary Discovery    : {'ENABLED' if sec_disc else 'DISABLED (Enrichment Only)'}")
+    print(f"Require Authentication   : {'YES' if req_login else 'NO'}")
+    print(f"Chrome Profile Directory : {prof_dir}")
+    print(f"Headless Mode            : {'YES' if headless else 'NO'}")
+    return 0
 
 
 def health_check() -> int:

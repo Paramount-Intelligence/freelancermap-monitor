@@ -239,6 +239,11 @@ class Config:
     # Freelancermap endpoints and authentication
     # -------------------------------------------------------------------------
 
+    CHROME_PROFILE_NAME = os.getenv(
+        "CHROME_PROFILE_NAME",
+        "Default",
+    ).strip() or "Default"
+
     BASE_URL = os.getenv(
         "FREELANCERMAP_BASE_URL",
         "https://www.freelancermap.com",
@@ -251,13 +256,33 @@ class Config:
 
     PROJECTS_URL = os.getenv(
         "FREELANCERMAP_PROJECTS_URL",
-        ACCOUNT_URL,
+        f"{BASE_URL}/projects",
     ).strip()
 
     LOGIN_URL = os.getenv(
         "FREELANCERMAP_LOGIN_URL",
         f"{BASE_URL}/login",
     ).strip()
+
+    PRIMARY_SEARCH_URL = os.getenv(
+        "FREELANCERMAP_PRIMARY_SEARCH_URL",
+        PROJECTS_URL,
+    ).strip() or PROJECTS_URL
+
+    PERSONALIZED_SEARCH_URL = os.getenv(
+        "FREELANCERMAP_PERSONALIZED_SEARCH_URL",
+        "",
+    ).strip()
+
+    ENABLE_PERSONALIZED_FEED = _env_bool(
+        "ENABLE_PERSONALIZED_FEED",
+        False,
+    )
+
+    PERSONALIZED_FEED_DISCOVERY = _env_bool(
+        "PERSONALIZED_FEED_DISCOVERY",
+        False,
+    )
 
     ALLOW_INSECURE_HTTP = _env_bool(
         "ALLOW_INSECURE_HTTP",
@@ -271,7 +296,7 @@ class Config:
 
     REQUIRE_LOGIN = _env_bool(
         "FREELANCERMAP_REQUIRE_LOGIN",
-        urlparse(PROJECTS_URL).path.casefold().startswith("/my_account"),
+        True,
     )
 
     LOGIN_EMAIL = os.getenv(

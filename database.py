@@ -20,7 +20,7 @@ from utils import json_dumps, utc_now_iso
 LOGGER = logging.getLogger(__name__)
 
 DATABASE_PATH: Path = Config.DATABASE_PATH
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # SQLite's default host-parameter ceiling is commonly 999 on older builds.
 # Keeping each dynamic IN clause below 900 preserves broad Python/SQLite
@@ -170,6 +170,8 @@ def initialize_database() -> None:
             _repair_schema_v7(conn)
         if _get_schema_version(conn) < 8:
             _repair_schema_v8(conn)
+        if _get_schema_version(conn) < 9:
+            _repair_schema_v9(conn)
         _create_indexes(conn)
         conn.execute(
             """
@@ -589,6 +591,15 @@ def _repair_schema_v8(conn: sqlite3.Connection) -> None:
            OR LOWER(title) LIKE '%resource is gone%';
         """
     )
+
+
+def _repair_schema_v9(conn: sqlite3.Connection) -> None:
+    """Add dual-feed discovery sources and position provenance columns."""
+    _ensure_column(conn, "projects", "discovery_sources_json", "TEXT NOT NULL DEFAULT '[\"primary_newest\"]'")
+    _ensure_column(conn, "projects", "seen_in_primary", "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(conn, "projects", "seen_in_personalized", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "projects", "primary_position", "INTEGER")
+    _ensure_column(conn, "projects", "personalized_position", "INTEGER")
 
 
 def _ensure_column(

@@ -302,20 +302,22 @@ def _discover(
     *,
     scan_at: str,
 ) -> list[ProjectDiscovery]:
-    """Load every configured listing page and return unique, validated cards."""
+    """Load primary search feed and optional secondary feed, returning deduplicated cards."""
 
+    primary_url = _safe_same_origin_url(getattr(Config, "PRIMARY_SEARCH_URL", Config.PROJECTS_URL))
     by_url: dict[str, ProjectDiscovery] = {}
     seen_listing_urls: set[str] = set()
-    listing_url = _safe_same_origin_url(Config.PROJECTS_URL)
     max_pages = int(getattr(Config, "MAX_PAGES", 1))
 
+    # 1. Scan Primary Feed (Newest First)
+    listing_url = primary_url
     for page_number in range(1, max_pages + 1):
         if listing_url in seen_listing_urls:
             LOGGER.warning("Pagination loop detected at %s; stopping.", listing_url)
             break
         seen_listing_urls.add(listing_url)
 
-        LOGGER.info("Scanning listing page %d: %s", page_number, listing_url)
+        LOGGER.info("Scanning primary listing page %d: %s", page_number, listing_url)
         projects = _load_listing_with_retries(
             browser,
             listing_url,
@@ -347,7 +349,6 @@ def _discover(
         next_url = browser.next_page_url()
         if not next_url:
             break
-
         next_url = _safe_same_origin_url(next_url)
         if next_url == listing_url or next_url in seen_listing_urls:
             LOGGER.warning("Pagination returned a repeated URL; stopping at %s", next_url)
@@ -358,6 +359,40 @@ def _discover(
             float(getattr(Config, "REQUEST_DELAY_MIN_SECONDS", 4.0)),
             float(getattr(Config, "REQUEST_DELAY_MAX_SECONDS", 8.0)),
         )
+
+    # 2. Scan Optional Secondary Feed (Personalized / Relevant)
+    enable_secondary = bool(getattr(Config, "ENABLE_PERSONALIZED_FEED", False))
+    secondary_url = getattr(Config, "PERSONALIZED_SEARCH_URL", "").strip()
+    allow_secondary_discovery = bool(getattr(Config, "PERSONALIZED_FEED_DISCOVERY", False))
+
+    if enable_secondary and secondary_url:
+        secondary_safe = _safe_same_origin_url(secondary_url)
+        LOGGER.info("Scanning optional secondary personalized feed: %s", secondary_safe)
+        try:
+            sec_projects = _load_listing_with_retries(
+                browser,
+                secondary_safe,
+                scan_at=scan_at,
+                page_number=1,
+            )
+            ignored_count = 0
+            for sec_project in sec_projects:
+                try:
+                    _validate_discovery(sec_project)
+                except Exception:
+                    continue
+                key = canonicalize_url(sec_project.url, Config.BASE_URL)
+                if key in by_url:
+                    existing = by_url[key]
+                    by_url[key] = _richer_discovery(existing, sec_project)
+                elif allow_secondary_discovery:
+                    by_url[key] = sec_project
+                else:
+                    ignored_count += 1
+            if ignored_count > 0:
+                LOGGER.info("Ignored %d secondary-only personalized projects (PERSONALIZED_FEED_DISCOVERY=false).", ignored_count)
+        except Exception as exc:
+            LOGGER.warning("Secondary personalized feed scan encountered error: %s", _safe_error(exc))
 
     return list(by_url.values())
 
@@ -852,10 +887,11 @@ def _baseline_initialized() -> bool:
 def _require_authenticated_session(browser: BrowserSession) -> None:
     if not bool(getattr(Config, "REQUIRE_LOGIN", True)):
         return
-    if not browser.is_logged_in():
+    res = browser.verify_authenticated_session()
+    if not res.authenticated:
         raise RuntimeError(
-            "The configured Freelancermap feed requires an authenticated Chrome "
-            "profile. Run: python main.py --interactive-login"
+            f"The configured Freelancermap feed requires an authenticated Chrome profile "
+            f"({res.reason}). Run: python main.py --interactive-login"
         )
 
 

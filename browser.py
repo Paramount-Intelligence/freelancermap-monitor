@@ -41,6 +41,21 @@ class PageState:
     empty: bool = False
 
 
+from dataclasses import dataclass
+from utils import exclusive_file_lock, canonicalize_url, polite_sleep, utc_now_iso
+
+
+class BrowserProfileInUseError(Exception):
+    """Raised when the persistent Chrome profile is locked by another process."""
+
+
+@dataclass
+class AuthVerificationResult:
+    """Detailed result of authenticating the current browser session."""
+    authenticated: bool = False
+    reason: str = ""
+
+
 class PageNotFoundError(Exception):
     """Raised when a 404 or 410 Not Found page is encountered."""
 
@@ -108,12 +123,25 @@ class BrowserSession:
             self.headless = bool(headless)
         self.driver_factory = driver_factory
         self.driver: WebDriver | None = None
+        self._profile_lock_context = None
         if autostart:
             self._ensure_driver()
 
     def _ensure_driver(self) -> None:
         if self.driver is not None:
             return
+
+        profile_dir = getattr(Config, "CHROME_PROFILE_DIR", None)
+        if profile_dir and not self.driver_factory:
+            lock_file = profile_dir.parent / "chrome_profile.lock"
+            try:
+                self._profile_lock_context = exclusive_file_lock(lock_file, timeout_seconds=1.0)
+                self._profile_lock_context.__enter__()
+            except Exception as exc:
+                raise BrowserProfileInUseError(
+                    f"Chrome profile at {profile_dir} is already locked by another process."
+                ) from exc
+
         options = Options()
         if self.headless:
             options.add_argument("--headless=new")
@@ -123,12 +151,14 @@ class BrowserSession:
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-blink-features=AutomationControlled")
         
-        # Configure persistent Chrome profile directory
-        profile_dir = getattr(Config, "CHROME_PROFILE_DIR", None)
+        # Configure persistent Chrome profile directory and profile name
         if profile_dir:
             profile_path = profile_dir.resolve()
             profile_path.mkdir(parents=True, exist_ok=True)
             options.add_argument(f"--user-data-dir={profile_path}")
+            profile_name = getattr(Config, "CHROME_PROFILE_NAME", "Default")
+            if profile_name:
+                options.add_argument(f"--profile-directory={profile_name}")
 
         options.add_argument(
             "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -146,13 +176,19 @@ class BrowserSession:
         self.driver.implicitly_wait(getattr(Config, "IMPLICIT_WAIT_SECONDS", 3))
 
     def close(self) -> None:
-        """Quit the underlying driver and release resources."""
+        """Quit the underlying driver and release profile locks."""
         if self.driver is not None:
             try:
                 self.driver.quit()
             except Exception:
                 pass
             self.driver = None
+        if self._profile_lock_context is not None:
+            try:
+                self._profile_lock_context.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._profile_lock_context = None
 
     def __enter__(self) -> "BrowserSession":
         return self
@@ -407,7 +443,43 @@ class BrowserSession:
         except Exception:
             pass
 
-        return self.get_page_source()
+    def verify_authenticated_session(self) -> AuthVerificationResult:
+        """Navigate to ACCOUNT_URL and verify if session is authenticated."""
+        try:
+            account_url = getattr(Config, "ACCOUNT_URL", "https://www.freelancermap.com/my_account.html")
+            validated = self._validated_navigation_url(account_url)
+            self.driver.get(validated)
+            self._wait_for_page_load()
+            self.accept_cookie_banner()
+
+            current = self.driver.current_url or ""
+            if _is_login_url(current):
+                return AuthVerificationResult(authenticated=False, reason=f"Redirected to login page: {current}")
+
+            state = self._page_state()
+            if state.login_required:
+                return AuthVerificationResult(authenticated=False, reason="Login page detected")
+            if state.challenge_detected:
+                return AuthVerificationResult(authenticated=False, reason="CAPTCHA/MFA security challenge detected")
+            if state.error_detected:
+                return AuthVerificationResult(authenticated=False, reason="Page error/status detected")
+
+            # Check for password input fields
+            passwords = self.driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
+            if passwords:
+                return AuthVerificationResult(authenticated=False, reason="Login password field present on page")
+
+            # Verify authenticated account markers in DOM
+            body = self._body_text()
+            if "my_account" in current or "account" in current.casefold() or "dashboard" in body.casefold() or "logout" in body.casefold() or "abmelden" in body.casefold() or "my freelancermap" in body.casefold():
+                return AuthVerificationResult(authenticated=True, reason="Authenticated account marker verified")
+
+            if self.is_logged_in():
+                return AuthVerificationResult(authenticated=True, reason="Session passed login checks")
+
+            return AuthVerificationResult(authenticated=False, reason="Could not verify authenticated markers on account page")
+        except Exception as exc:
+            return AuthVerificationResult(authenticated=False, reason=f"Authentication check failed with error: {exc}")
 
     def is_logged_in(self) -> bool:
         """Return True if the browser session appears authenticated.
