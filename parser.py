@@ -35,6 +35,10 @@ POSTED_RE = re.compile(
     r"\b(?:just now|moments? ago|today|yesterday|\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago)\b",
     re.I,
 )
+PUBLISHED_ON_RE = re.compile(
+    r"\bpublished\s+(?:on\s+)?\d{1,2}[./-]\d{1,2}[./-]\d{4}(?:\s*,?\s*\d{1,2}:\d{2}\s*(?:AM|PM)?)?",
+    re.I,
+)
 PUBLISHED_RE = re.compile(
     r"Published\s+on\s+(\d{1,2}/\d{1,2}/\d{4}),?\s*(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))",
     re.I,
@@ -1067,7 +1071,10 @@ def _apply_json_ld(detail: ProjectDetail, job: dict[str, Any], base_url: str) ->
     if not job:
         return
     detail.title = normalize_space(_as_text(job.get("title")))
-    detail.description_html = _as_text(job.get("description"))
+    raw_description = job.get("description")
+    if isinstance(raw_description, list):
+        raw_description = "\n".join(_as_text(item) for item in raw_description if _as_text(item))
+    detail.description_html = _as_text(raw_description)
     detail.description = _multiline_text(BeautifulSoup(detail.description_html, "lxml"))
     detail.published_at = normalize_space(_as_text(job.get("datePosted")))
     detail.publication_text = detail.publication_text or detail.published_at
@@ -1705,7 +1712,7 @@ def _split_location(detail: ProjectDetail) -> None:
     cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
     detail.location = cleaned
     pieces = [normalize_space(value) for value in detail.location.split(",") if normalize_space(value)]
-    if pieces and not detail.city:
+    if pieces and not detail.city and pieces[0].casefold() not in {"remote", "worldwide", "anywhere"}:
         detail.city = pieces[0]
     if len(pieces) > 1 and not detail.country:
         detail.country = pieces[-1]
@@ -1729,7 +1736,7 @@ def _extract_location_from_lines(lines: list[str]) -> str:
                 combined = normalize_space(f"{clean_line} {next_line}")
                 combined = re.sub(r"^[,\s]+|[,\s]+$", "", combined)
                 return re.sub(r"\s*,\s*", ", ", combined)
-        if "," in clean_line and not _looks_like_fact_value(clean_line) and not clean_line.casefold().startswith("contact person"):
+        if "," in clean_line and not _looks_like_fact_value(clean_line) and not clean_line.casefold().startswith("contact person") and not _is_metadata_line(clean_line):
             combined = re.sub(r"^[,\s]+|[,\s]+$", "", clean_line)
             combined = re.sub(r"\s*,\s*", ", ", combined)
             if combined:
@@ -1796,7 +1803,12 @@ def _is_fact_label(value: str) -> bool:
 
 def _is_metadata_line(value: str) -> bool:
     lowered = value.casefold()
-    return bool(POSTED_RE.fullmatch(value) or VIEWS_RE.fullmatch(value) or lowered in {"views", "posted"})
+    return bool(
+        POSTED_RE.fullmatch(value)
+        or PUBLISHED_ON_RE.search(value)
+        or VIEWS_RE.fullmatch(value)
+        or lowered in {"views", "posted"}
+    )
 
 
 def _is_noise_line(line: str) -> bool:
@@ -2050,11 +2062,17 @@ def _parse_absolute_datetime(text: str, scanned: datetime) -> datetime | None:
         return parsed.astimezone(timezone.utc).replace(microsecond=0)
 
     formats = (
-        "%d.%m.%Y %H:%M",
+        "%m/%d/%Y %H:%M",
+        "%m.%d.%Y %H:%M",
+        "%m-%d-%Y %H:%M",
+        "%m/%d/%Y",
+        "%m.%d.%Y",
+        "%m-%d-%Y",
         "%d/%m/%Y %H:%M",
+        "%d.%m.%Y %H:%M",
         "%d-%m-%Y %H:%M",
-        "%d.%m.%Y",
         "%d/%m/%Y",
+        "%d.%m.%Y",
         "%d-%m-%Y",
         "%d %B %Y %H:%M",
         "%d %b %Y %H:%M",
@@ -2079,14 +2097,14 @@ def _parse_absolute_datetime(text: str, scanned: datetime) -> datetime | None:
 
     # Search for a date embedded inside a longer label.
     embedded_patterns = (
-        (r"\b\d{1,2}[./-]\d{1,2}[./-]\d{4}(?:\s+\d{1,2}:\d{2})?\b", formats[:6]),
+        (r"\b\d{1,2}[./-]\d{1,2}[./-]\d{4}(?:\s+\d{1,2}:\d{2})?\b", formats[:12]),
         (
             r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}(?:\s+\d{1,2}:\d{2})?\b",
-            formats[6:10],
+            formats[12:20],
         ),
         (
             r"\b[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}(?:\s+\d{1,2}:\d{2})?\b",
-            formats[10:],
+            formats[20:],
         ),
     )
     for pattern, candidate_formats in embedded_patterns:

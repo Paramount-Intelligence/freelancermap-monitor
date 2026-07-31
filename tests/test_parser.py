@@ -6,6 +6,11 @@ from parser import (
     parse_listing_cards,
     parse_project_detail,
     parse_relative_posted_time,
+    ProjectDetail,
+    _extract_location_from_lines,
+    _is_metadata_line,
+    _parse_absolute_datetime,
+    _split_location,
 )
 
 BASE = "https://www.freelancermap.com"
@@ -194,6 +199,68 @@ class EnhancedParserTests(unittest.TestCase):
         project = parse_listing_cards(html, BASE, SCAN)[0]
         self.assertEqual("29.07.2026", project.posted_text)
         self.assertEqual("2026-07-29T00:00:00+00:00", project.posted_at)
+
+    def test_published_on_line_is_metadata_not_location(self):
+        self.assertTrue(_is_metadata_line("Published on 07/31/2026, 08:34 PM"))
+        self.assertTrue(_is_metadata_line("Published 07/31/2026"))
+        self.assertEqual(
+            "Berlin, Germany",
+            _extract_location_from_lines(
+                ["Published on 07/31/2026, 08:34 PM", "Berlin, Germany"]
+            ),
+        )
+
+    def test_us_date_only_formats_parse(self):
+        scan = datetime(2026, 7, 31, 21, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            datetime(2026, 7, 31, 0, 0, tzinfo=timezone.utc),
+            _parse_absolute_datetime("07/31/2026", scan),
+        )
+        self.assertEqual(
+            datetime(2026, 12, 31, 0, 0, tzinfo=timezone.utc),
+            _parse_absolute_datetime("12/31/2026", scan),
+        )
+        self.assertEqual(
+            datetime(2026, 11, 12, 0, 0, tzinfo=timezone.utc),
+            _parse_absolute_datetime("11/12/2026", scan),
+        )
+
+    def test_eu_dates_still_parse_day_first(self):
+        scan = datetime(2026, 7, 31, 21, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            datetime(2026, 7, 31, 0, 0, tzinfo=timezone.utc),
+            _parse_absolute_datetime("31.07.2026", scan),
+        )
+        self.assertEqual(
+            datetime(2026, 5, 13, 0, 0, tzinfo=timezone.utc),
+            _parse_absolute_datetime("13/05/2026", scan),
+        )
+
+    def test_split_location_does_not_use_remote_as_city(self):
+        detail = ProjectDetail(source_key="k", slug="k", url="u")
+        detail.location = "Remote, United Kingdom"
+        _split_location(detail)
+        self.assertEqual("", detail.city)
+        self.assertEqual("United Kingdom", detail.country)
+
+    def test_json_ld_list_description_is_joined(self):
+        html = '''
+        <html><head>
+        <script type="application/ld+json">{
+          "@context": "https://schema.org",
+          "@type": "JobPosting",
+          "title": "Platform Engineer",
+          "datePosted": "2026-07-31",
+          "url": "/project/platform-engineer-1",
+          "description": ["First paragraph.", "Second paragraph."],
+          "hiringOrganization": {"@type": "Organization", "name": "Acme GmbH"}
+        }</script>
+        </head><body><main><h1>Platform Engineer</h1>
+        <p>First paragraph.</p><p>Second paragraph.</p></main></body></html>
+        '''
+        detail = parse_project_detail(html, "https://www.freelancermap.com/project/platform-engineer-1", BASE, SCAN)
+        self.assertIn("First paragraph.", detail.description)
+        self.assertIn("Second paragraph.", detail.description)
 
 
 if __name__ == "__main__":

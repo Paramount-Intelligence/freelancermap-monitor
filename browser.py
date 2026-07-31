@@ -76,7 +76,7 @@ CHALLENGE_BODY_RE = re.compile(
     re.I,
 )
 ERROR_TITLE_RE = re.compile(
-    r"(?:^|\b)(?:404|410|429|500|502|503)\b"
+    r"(?<![£€$¥₹.,/\w])(?:404|410|429|500|502|503)\b"
     r"|not\s+found"
     r"|page\s+does\s+not\s+exist"
     r"|resource\s+is\s+gone"
@@ -84,7 +84,7 @@ ERROR_TITLE_RE = re.compile(
     re.I,
 )
 ERROR_BODY_RE = re.compile(
-    r"(?:^|\b)(?:404|410|429|500|502|503)\b"
+    r"(?<![£€$¥₹.,/\w])(?:404|410|429|500|502|503)\b"
     r"|not\s+found"
     r"|page\s+does\s+not\s+exist"
     r"|resource\s+is\s+gone"
@@ -643,17 +643,49 @@ class BrowserSession:
                 LOGGER.warning("Could not locate login form fields on %s", validated)
                 return False
             email_field = email_inputs[0]
+            password_field = password_inputs[0]
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                try:
+                    if email_field.is_enabled() and email_field.is_displayed() and password_field.is_enabled() and password_field.is_displayed():
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            else:
+                LOGGER.warning("Login form fields never became interactable on %s", validated)
+                return False
+            email_field.click()
             email_field.clear()
             email_field.send_keys(email)
-            password_field = password_inputs[0]
+            password_field.click()
             password_field.clear()
             password_field.send_keys(password)
+            submit_button = None
             submit_buttons = self.driver.find_elements(
                 By.CSS_SELECTOR,
                 "button[type='submit'], input[type='submit'], button[name='submit']",
             )
-            if submit_buttons:
-                submit_buttons[0].click()
+            for candidate in submit_buttons:
+                try:
+                    if candidate.is_displayed() and candidate.is_enabled():
+                        submit_button = candidate
+                        break
+                except Exception:
+                    continue
+            if submit_button is None:
+                labeled_buttons = self.driver.find_elements(By.CSS_SELECTOR, "button")
+                for candidate in labeled_buttons:
+                    try:
+                        label = candidate.text.strip().casefold()
+                        clickable = candidate.is_displayed() and candidate.is_enabled()
+                    except Exception:
+                        continue
+                    if clickable and label in ("log in", "login", "sign in", "anmelden"):
+                        submit_button = candidate
+                        break
+            if submit_button is not None:
+                submit_button.click()
             else:
                 password_field.submit()
             self._wait_for_page_load()

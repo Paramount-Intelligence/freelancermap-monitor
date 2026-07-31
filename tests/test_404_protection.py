@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import database
-from browser import PageNotFoundError, ERROR_TITLE_RE
+from browser import PageNotFoundError, ERROR_BODY_RE, ERROR_TITLE_RE
 from config import Config
 from monitor import DetailValidationError, validate_detail
 from parser import parse_project_detail
@@ -43,6 +43,19 @@ class Test404Protection(unittest.TestCase):
         self.assertTrue(ERROR_TITLE_RE.search("410 Resource is Gone"))
         self.assertTrue(ERROR_TITLE_RE.search("429 Too Many Requests"))
         self.assertFalse(ERROR_TITLE_RE.search("Senior Python Developer"))
+
+    def test_error_body_regex_does_not_flag_currency_amounts(self):
+        self.assertFalse(ERROR_BODY_RE.search("SC Cleared SOC Analyst - £500/day via Umbrella"))
+        self.assertFalse(ERROR_BODY_RE.search("€404,000 budget per year"))
+        self.assertFalse(ERROR_BODY_RE.search("Rate: $500.00 per day"))
+        self.assertFalse(ERROR_BODY_RE.search("Onboarding fee 1.500 EUR"))
+        self.assertFalse(ERROR_BODY_RE.search("Senior Python Developer - £410/day contract"))
+
+    def test_error_body_regex_still_flags_real_error_states(self):
+        self.assertTrue(ERROR_BODY_RE.search("500 Internal Server Error"))
+        self.assertTrue(ERROR_BODY_RE.search("Page 404 - Not Found"))
+        self.assertTrue(ERROR_BODY_RE.search("HTTP 429 Too Many Requests"))
+        self.assertTrue(ERROR_BODY_RE.search("Something went wrong, please try again later"))
 
     def test_parser_rejects_404_page(self):
         detail = parse_project_detail(HTML_404, "https://www.freelancermap.com/project/test", "https://www.freelancermap.com")
