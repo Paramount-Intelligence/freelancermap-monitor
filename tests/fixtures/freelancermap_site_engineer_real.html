@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Freelance Projects</title>
+  <meta property="og:title" content="Freelance IT Projects" />
+</head>
+<body>
+  <main class="grid-project-list">
+
+    <!-- ====== Listing cards ====== -->
+
+    <!-- Valid card for Site Engineer II -->
+    <article class="project-card" data-id="project-card-site-engineer-ii">
+      <div class="project-card-header">
+        <a data-href="/project/site-engineer-ii" class="project-card-title">Site Engineer II</a>
+        <span class="project-card-company">Darwin Recruitment</span>
+      </div>
+      <div class="project-card-body">
+        <span data-testid="city">Rozenburg, Netherlands</span>
+        <span data-testid="workplace">On-site</span>
+        <span data-testid="type">Freelance</span>
+        <span data-testid="beginningText">7/2026</span>
+        <span data-testid="created">30.07.2026</span>
+      </div>
+      <div class="project-card-footer">
+        <span class="project-card-views">12 views</span>
+      </div>
+    </article>
+
+    <!-- ====== JSON state script tag ====== -->
+    <script type="application/json" data-component-name="ProjectSearchResultList">
+    {
+      "projects": [
+        {
+          "title": "Site Engineer II",
+          "company": "Darwin Recruitment",
+          "description": "<p>Looking for an experienced Site Engineer to join our client's team in the Netherlands.</p><h3>Responsibilities</h3><ul><li>Oversee daily site operations</li><li>Coordinate subcontractors</li></ul><h3>Requirements</h3><ul><li>5+ years in civil engineering</li><li>Fluent in English</li></ul>",
+          "city": "Rozenburg",
+          "country": {"name": "Netherlands"},
+          "projectContractType": {"type": "Freelance", "remoteInPercent": 0},
+          "durationText": "",
+          "beginningText": "7/2026",
+          "created": "2026-07-30T20:01:30+02:00",
+          "viewCount": 12,
+          "links": {"project": "/project/site-engineer-ii"}
+        }
+      ]
+    }
+    </script>
+
+    <!-- ====== Detail modal (visible) ====== -->
+    <div class="search-result-modal show" aria-hidden="false">
+      <div class="modal-content">
+        <div class="grid-project-show">
+          <div class="project-header">
+            <h1>Site Engineer II</h1>
+            <a data-id="project-show-company-link" href="/project-provider/darwin-recruitment">Darwin Recruitment</a>
+            <div class="project-header-info-list">
+              <span class="badge">Rozenburg, Netherlands</span>
+              <span class="badge">On-site</span>
+              <span class="badge">Freelance</span>
+              <span class="badge">7/2026</span>
+            </div>
+            <div class="project-info-name">Alex Deery</div>
+            <div class="project-header-report">
+              <span data-testid="created">07/30/2026, 11:38 PM</span>
+              <span data-testid="viewCount">12 views</span>
+            </div>
+          </div>
+
+          <div class="project-body">
+            <h2>Description</h2>
+            <div class="project-body-description">
+              <p>Looking for an experienced Site Engineer to join our client's team in the Netherlands.</p>
+              <h3>Responsibilities</h3>
+              <ul>
+                <li>Oversee daily site operations</li>
+                <li>Coordinate subcontractors and suppliers</li>
+                <li>Ensure health and safety compliance</li>
+                <li>Manage project timelines and deliverables</li>
+              </ul>
+              <h3>Requirements</h3>
+              <ul>
+                <li>5+ years in civil engineering or site management</li>
+                <li>Fluent in English; Dutch is a plus</li>
+                <li>Strong leadership and communication skills</li>
+                <li>Experience with Eurocode standards</li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- Similar projects section (must not leak into main detail) -->
+          <div data-testid="similar-projects">
+            <h3>Similar projects</h3>
+            <div class="project-card">
+              <a data-href="/project/senior-site-engineer" class="project-card-title">Senior Site Engineer</a>
+              <span data-testid="duration">12 months+</span>
+              <span data-testid="beginningText">asap</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ====== Hidden report modal (must not leak data) ====== -->
+    <div class="modal project-header-report-modal hidden" aria-hidden="true">
+      <p>Incorrect contract type</p>
+      <p>The hourly rate is unrealistic</p>
+    </div>
+
+  </main>
+</body>
+</html>

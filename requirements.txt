@@ -1,0 +1,5 @@
+beautifulsoup4>=4.12,<5
+lxml>=5,<7
+python-dotenv>=1.0,<2
+selenium>=4.20,<5
+tzdata>=2025.2,<2027
