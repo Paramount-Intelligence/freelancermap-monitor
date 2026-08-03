@@ -207,8 +207,11 @@ class EnhancedDatabaseTests(unittest.TestCase):
         destination = Path(self.tempdir.name) / "backup.db"
         database.backup_database(destination)
         self.assertTrue(destination.exists())
-        with sqlite3.connect(destination) as conn:
+        conn = sqlite3.connect(destination)
+        try:
             self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+        finally:
+            conn.close()
         health = database.database_health()
         self.assertTrue(health["ok"], health["issues"])
         self.assertEqual(database.SCHEMA_VERSION, health["schema_version"])
