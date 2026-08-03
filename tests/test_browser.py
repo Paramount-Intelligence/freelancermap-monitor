@@ -115,14 +115,30 @@ class BrowserSessionEnhancedTests(unittest.TestCase):
             False,
             create=True,
         )
+        self.stability_patch = patch.object(
+            Config,
+            "LISTING_STABILITY_POLL_SECONDS",
+            0.01,
+            create=True,
+        )
+        self.timeout_patch = patch.object(
+            Config,
+            "PAGE_LOAD_TIMEOUT",
+            10,
+            create=True,
+        )
         self.driver_patch = patch.object(BrowserSession, "_ensure_driver", lambda self: setattr(self, "driver", FakeDriver()))
         self.base_patch.start()
         self.http_patch.start()
         self.cross_patch.start()
+        self.stability_patch.start()
+        self.timeout_patch.start()
         self.driver_patch.start()
         self.addCleanup(self.base_patch.stop)
         self.addCleanup(self.http_patch.stop)
         self.addCleanup(self.cross_patch.stop)
+        self.addCleanup(self.stability_patch.stop)
+        self.addCleanup(self.timeout_patch.stop)
         self.addCleanup(self.driver_patch.stop)
 
     def test_relative_navigation_is_same_origin_and_preserves_query(self) -> None:
@@ -304,7 +320,7 @@ class BrowserSessionEnhancedTests(unittest.TestCase):
             )
         self.assertIn("Projects available", html)
 
-    def test_listing_page_skips_sort_check_when_state_unverifiable(self) -> None:
+    def test_listing_page_accepts_sort_proven_by_url(self) -> None:
         session = BrowserSession(headless=True)
         session.driver = FakeDriver()  # type: ignore[assignment]
         with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):

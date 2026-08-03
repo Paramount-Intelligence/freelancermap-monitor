@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import database
 import monitor
 from config import Config
 from parser import ProjectDetail, ProjectDiscovery
@@ -275,6 +276,36 @@ class MonitorEnhancedTests(unittest.TestCase):
             "https://www.freelancermap.com/projects?sort=1",
             monitor._safe_same_origin_url("/projects?sort=1"),
         )
+
+    def test_refused_first_run_leaves_zero_scan_rows_and_no_baseline_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_refused.db"
+            lock_path = Path(folder) / "test_refused.lock"
+            with patch.object(database, "DATABASE_PATH", db_path), \
+                 patch.object(Config, "LOCK_PATH", lock_path), \
+                 patch.object(Config, "AUTO_BASELINE_ON_FIRST_RUN", False), \
+                 patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"), \
+                 patch("monitor.exclusive_file_lock"):
+                database.initialize_database()
+                with self.assertRaisesRegex(RuntimeError, "Baseline is not initialized"):
+                    monitor.run_cycle(dry_run=False, force_baseline=False, headless=True)
+                with database.connection() as conn:
+                    total = conn.execute(
+                        "SELECT COUNT(*) AS c FROM scans"
+                    ).fetchone()["c"]
+                    running = conn.execute(
+                        "SELECT COUNT(*) AS c FROM scans WHERE status='running'"
+                    ).fetchone()["c"]
+                self.assertEqual(0, total)
+                self.assertEqual(0, running)
+                self.assertEqual(
+                    "false",
+                    database.get_setting("baseline_initializing", "false"),
+                )
+                self.assertEqual(
+                    "false",
+                    database.get_setting("baseline_started_at", "false"),
+                )
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from config import Config
+from config import Config, _is_feed_listing_path
 from pagedetect import (
     ERROR_BODY_RE,
     ERROR_TITLE_RE,
@@ -40,6 +40,15 @@ LOGGER = logging.getLogger(__name__)
 
 class BrowserNavigationError(Exception):
     """Raised when a navigation target fails origin or safety checks."""
+
+
+class PageLoadTimeoutError(Exception):
+    """Raised when a page never reached a usable ready state in time.
+
+    The message carries the requested or final URL (never the page HTML)
+    and the timeout duration so failures close safely instead of parsing
+    partial or unloaded content.
+    """
 
 
 @dataclass
@@ -398,33 +407,25 @@ class BrowserSession:
         path = urlparse(validated).path
         if not PROJECT_PATH_RE.fullmatch(path) and not re.search(r"/project/[^/?#]+$", path):
             raise BrowserNavigationError("URL is not a project detail page")
+        project_key = path.rstrip("/").rsplit("/", 1)[-1]
         self.driver.get(validated)
-        self._wait_for_page_load()
+        self._require_usable_page(
+            expected_kind="detail",
+            requested_url=url,
+            expected_project_key=project_key,
+        )
         self.accept_cookie_banner()
-        
-        state = self._page_state()
-        if state.error_detected:
-            title = (self.driver.title or "").strip()
-            if has_error_title(title):
-                raise PageNotFoundError(f"Detail page {url} returned 404/Error: '{title}'")
-            raise HttpError(f"Detail page {url} returned error state: '{title}'")
-            
         return self.get_page_source()
 
     def get(self, url: str) -> str:
         """Navigate to a URL and return the page source HTML."""
         validated = self._validated_navigation_url(url)
         self.driver.get(validated)
-        self._wait_for_page_load()
+        self._require_usable_page(
+            expected_kind="generic",
+            requested_url=url,
+        )
         self.accept_cookie_banner()
-        
-        state = self._page_state()
-        if state.error_detected:
-            title = (self.driver.title or "").strip()
-            if has_error_title(title):
-                raise PageNotFoundError(f"Page {url} returned 404/Error: '{title}'")
-            raise HttpError(f"Page {url} returned error state: '{title}'")
-            
         return self.get_page_source()
 
     def _current_sort_state(self) -> str | None:
@@ -456,9 +457,13 @@ class BrowserSession:
             pass
         return None
 
-    def _wait_for_loading_finished(self, timeout: float | None = None) -> None:
-        """Wait until no loading indicator is visible in the listing DOM."""
-        timeout = timeout or float(getattr(Config, "PAGE_LOAD_TIMEOUT", 30))
+    def _visible_loading_indicator(self) -> bool:
+        """True when any loading indicator is currently visible in the DOM.
+
+        Only ``is_displayed()`` elements count: hidden spinners, skeleton
+        templates, or CSS-only loaders that are not rendered must never
+        block an otherwise usable page.
+        """
         selectors = (
             ".loading",
             ".spinner",
@@ -466,19 +471,294 @@ class BrowserSession:
             "[aria-busy='true']",
             ".skeleton",
         )
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            busy = False
-            for selector in selectors:
+        for selector in selectors:
+            try:
+                for element in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                    try:
+                        if element.is_displayed():
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return False
+
+    def _load_more_available(self) -> bool:
+        """True when a legitimate, visible load-more control is present."""
+        if not self.driver:
+            return False
+        try:
+            buttons = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "a.btn-load-more, button.btn-load-more, .load-more-button, a[data-action='load-more']",
+            )
+            for btn in buttons:
                 try:
-                    if self.driver.find_elements(By.CSS_SELECTOR, selector):
-                        busy = True
-                        break
+                    if btn.is_displayed():
+                        return True
                 except Exception:
                     continue
-            if not busy:
+        except Exception:
+            pass
+        return False
+
+    def _document_height(self) -> int:
+        """Return the current rendered document height, or 0 on failure."""
+        try:
+            value = self.driver.execute_script(
+                "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
+            )
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    def _listing_snapshot(self) -> tuple[int, int, bool, bool]:
+        """Snapshot the listing state for stability detection.
+
+        A stable listing requires the project-route count, the document
+        height, the visible loading indicators, and the load-more
+        availability to all be unchanged for the configured number of
+        consecutive rounds.
+        """
+        return (
+            self._project_route_count(),
+            self._document_height(),
+            self._visible_loading_indicator(),
+            self._load_more_available(),
+        )
+
+    def _wait_for_listing_stability(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Wait for the listing to remain stable for LISTING_STABLE_ROUNDS.
+
+        Raises PageLoadTimeoutError when the deadline passes first, so a
+        constantly-growing or never-settling listing never gets parsed
+        while it is still loading.
+        """
+        required = max(1, int(getattr(Config, "LISTING_STABLE_ROUNDS", 2)))
+        timeout = timeout or float(getattr(Config, "PAGE_LOAD_TIMEOUT", 30))
+        poll = max(
+            0.01,
+            float(getattr(Config, "LISTING_STABILITY_POLL_SECONDS", 0.5)),
+        )
+        deadline = time.monotonic() + timeout
+        stable_rounds = 0
+        previous: tuple[int, int, bool, bool] | None = None
+        while time.monotonic() < deadline:
+            snapshot = self._listing_snapshot()
+            if previous is not None and snapshot == previous:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+            previous = snapshot
+            if stable_rounds >= required:
                 return
-            time.sleep(0.5)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll, remaining))
+        raise PageLoadTimeoutError(
+            "Listing did not stabilize within "
+            f"{timeout:.0f}s ({required} consecutive stable round(s) "
+            "never observed)."
+        )
+
+    def _wait_for_loading_finished(
+        self,
+        timeout: float | None = None,
+    ) -> bool:
+        """Wait until no loading indicator is visible in the listing DOM.
+
+        Returns True when the listing is free of visible loading
+        indicators, and False if the deadline passed with an indicator
+        still displayed. Callers must treat False as a timeout and never
+        silently continue parsing partial content.
+        """
+        timeout = timeout or float(getattr(Config, "PAGE_LOAD_TIMEOUT", 30))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._visible_loading_indicator():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.5, remaining))
+        return not self._visible_loading_indicator()
+
+    def _current_url_sort_value(self) -> str | None:
+        """Read the configured sort parameter from the final URL, if present."""
+        param = str(getattr(Config, "FEED_QUERY_SORT_PARAM", "sort"))
+        try:
+            parsed = urlparse(self.driver.current_url or "")
+            for part in (parsed.query or "").split("&"):
+                name, _, value = part.partition("=")
+                if name.casefold() == param.casefold():
+                    return value or None
+        except Exception:
+            pass
+        return None
+
+    def _verify_listing_sort(self, expected_sort: str) -> None:
+        """Fail closed unless the final URL or a rendered control proves the sort.
+
+        The final URL is proven by the configured sort parameter in the
+        final URL; the rendered control is the checked sort radio or the
+        active dropdown entry. A conflict from either source raises;
+        missing proof from both sources raises as well.
+        """
+        url_sort = self._current_url_sort_value()
+        dom_sort = self._current_sort_state()
+        current = self.driver.current_url or "(unknown URL)"
+
+        if url_sort is not None and url_sort != expected_sort:
+            raise HttpError(
+                f"Listing page {current} is sorted {url_sort!r} per its "
+                f"final URL, expected {expected_sort!r}. Refusing to scan a "
+                "differently sorted feed."
+            )
+        if dom_sort is not None and dom_sort != expected_sort:
+            raise HttpError(
+                f"Listing page {current} renders sort {dom_sort!r}, "
+                f"expected {expected_sort!r}. Refusing to scan a differently "
+                "sorted feed."
+            )
+        if url_sort != expected_sort and dom_sort != expected_sort:
+            raise HttpError(
+                f"Listing page {current} neither carries sort={expected_sort} "
+                "in its final URL nor renders a control proving the expected "
+                "sort value. Refusing to scan an unverifiable feed."
+            )
+
+    def _visible_password_form(self) -> bool:
+        """True when a visible password input is present in the DOM."""
+        try:
+            for element in self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "input[type='password']",
+            ):
+                try:
+                    if element.is_displayed():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _require_usable_page(
+        self,
+        *,
+        expected_kind: str,
+        requested_url: str = "",
+        expected_project_key: str = "",
+        expected_sort: str | None = None,
+    ) -> None:
+        """Fail-closed post-navigation boundary applied after every driver.get().
+
+        Validates document readiness, a non-empty usable body, an HTTPS
+        same-origin final URL free of credentials and control characters,
+        the expected route type, the absence of login redirects, active
+        password forms, CAPTCHA/MFA challenges, and HTTP error pages, the
+        exact project identity on detail pages, and listing route/sort
+        preservation on listing pages. Any violation raises instead of
+        returning partial HTML to a parser.
+        """
+        self._wait_for_page_load(requested_url=requested_url)
+
+        current = self.driver.current_url or ""
+        parsed = urlparse(current)
+
+        if parsed.username is not None or parsed.password is not None:
+            raise BrowserNavigationError(
+                "Final URL must not contain embedded credentials"
+            )
+        if any(character in current for character in ("\n", "\r", "\x00")):
+            raise BrowserNavigationError("Final URL contains control characters")
+        scheme = parsed.scheme.casefold()
+        if scheme not in {"http", "https"}:
+            raise BrowserNavigationError(
+                f"Final URL has an unsupported scheme: {scheme or '(none)'}"
+            )
+        if scheme == "http" and not Config.ALLOW_INSECURE_HTTP:
+            raise BrowserNavigationError(
+                "Final URL is not HTTPS; insecure navigation is not allowed"
+            )
+        if not self._same_origin(current, Config.BASE_URL):
+            raise BrowserNavigationError(
+                "Final URL left the configured origin"
+            )
+
+        body_text = self._body_text()
+        if not self._is_page_ready(body_text):
+            raise PageLoadTimeoutError(
+                "Document never reached a ready state on "
+                f"{requested_url or current} within "
+                f"{int(getattr(Config, 'PAGE_LOAD_TIMEOUT', 30))}s."
+            )
+
+        state = self._page_state()
+        if state.empty:
+            raise HttpError(
+                "The page body is empty after navigating to "
+                f"{requested_url or current}; refusing to parse partial HTML."
+            )
+        if state.error_detected:
+            title = (self.driver.title or "").strip()
+            if has_error_title(title):
+                raise PageNotFoundError(
+                    f"Page {requested_url or current} returned "
+                    f"404/Error: '{title}'"
+                )
+            raise HttpError(
+                f"Page {requested_url or current} returned an error "
+                f"state: '{title}'"
+            )
+        if state.challenge_detected:
+            raise HttpError(
+                "A CAPTCHA, bot check, or MFA challenge page was encountered "
+                "after navigating to "
+                f"{requested_url or current}; refusing to continue."
+            )
+        if _is_login_url(current):
+            raise HttpError(
+                "Navigated to a login page when protected content was "
+                f"expected: {current}"
+            )
+        if self._visible_password_form():
+            raise HttpError(
+                "A password form is still active on "
+                f"{requested_url or current}; the session is not "
+                "authenticated."
+            )
+
+        path = parsed.path or "/"
+        if expected_kind == "detail":
+            if not PROJECT_PATH_RE.fullmatch(path) and not re.search(
+                r"/project/[^/?#]+$",
+                path,
+            ):
+                raise BrowserNavigationError(
+                    "Final URL is not a project detail page"
+                )
+            if expected_project_key and (
+                path.rstrip("/").casefold()
+                != f"/project/{expected_project_key}".casefold()
+            ):
+                raise HttpError(
+                    f"Final URL {current} does not match the requested "
+                    f"project {expected_project_key!r}."
+                )
+        elif expected_kind == "listing":
+            if not _is_feed_listing_path(path):
+                raise BrowserNavigationError(
+                    "Final URL is not a listing/search route: "
+                    f"{current}"
+                )
+            if expected_sort is not None:
+                self._verify_listing_sort(expected_sort)
 
     def load_listing_page(
         self,
@@ -489,34 +769,27 @@ class BrowserSession:
         """Navigate to a listing page, verify sort state, and load dynamic content.
 
         Scrolling uses ``Config.MAX_SCROLLS_PER_PAGE``, load-more buttons are
-        clicked at most ``Config.MAX_LOAD_MORE_CLICKS`` times, and each round
-        waits for loading indicators and a stable project-route count.
+        clicked at most ``Config.MAX_LOAD_MORE_CLICKS`` times, and every
+        phase waits for ``Config.LISTING_STABLE_ROUNDS`` consecutive stable
+        rounds (project-route count, document height, visible loading
+        indicators, and load-more availability) before continuing. Any
+        timeout raises instead of parsing a page that is still loading.
         """
         validated = self._validated_navigation_url(url)
         self.driver.get(validated)
-        self._wait_for_page_load()
+        self._require_usable_page(
+            expected_kind="listing",
+            requested_url=url,
+            expected_sort=expected_sort,
+        )
         self.accept_cookie_banner()
-
-        state = self._page_state()
-        if state.error_detected:
-            title = (self.driver.title or "").strip()
-            if has_error_title(title):
-                raise PageNotFoundError(f"Listing page {url} returned 404/Error: '{title}'")
-            raise HttpError(f"Listing page {url} returned error state: '{title}'")
-
-        if expected_sort is not None:
-            actual_sort = self._current_sort_state()
-            if actual_sort is not None and actual_sort != expected_sort:
-                raise HttpError(
-                    f"Listing page {url} is sorted {actual_sort!r}, expected "
-                    f"newest-first (sort={expected_sort}). Refusing to scan a "
-                    "differently sorted feed."
-                )
+        self._wait_for_listing_stability()
 
         # Scroll to load lazy content using the configured per-page scroll cap.
         max_scrolls = int(getattr(Config, "MAX_SCROLLS_PER_PAGE", 6))
         if max_scrolls > 0:
             self.scroll_to_bottom(max_scrolls=max_scrolls)
+        self._wait_for_listing_stability()
 
         # Click 'load more' repeatedly, waiting for content to stabilise.
         max_clicks = int(getattr(Config, "MAX_LOAD_MORE_CLICKS", 3))
@@ -525,7 +798,13 @@ class BrowserSession:
                 before = self._project_route_count()
                 if not self.click_load_more():
                     break
-                self._wait_for_loading_finished()
+                if not self._wait_for_loading_finished():
+                    raise PageLoadTimeoutError(
+                        "Loading indicators never cleared after a load-more "
+                        "click within "
+                        f"{int(getattr(Config, 'PAGE_LOAD_TIMEOUT', 30))}s."
+                    )
+                self._wait_for_listing_stability()
                 after = self._project_route_count()
                 if after <= before:
                     break
@@ -533,30 +812,27 @@ class BrowserSession:
         return self.get_page_source()
 
     def verify_authenticated_session(self) -> AuthVerificationResult:
-        """Navigate to ACCOUNT_URL and verify if session is authenticated."""
+        """Navigate to ACCOUNT_URL and verify if session is authenticated.
+
+        The shared post-navigation boundary runs first (readiness, HTTPS
+        same-origin final URL, no error/challenge/login/password pages).
+        Any violation is converted into an unauthenticated result. Only a
+        positive visible authenticated marker -- a logout link, the user
+        menu/avatar, or an account-dashboard phrase -- counts as success.
+        """
         try:
             account_url = getattr(Config, "ACCOUNT_URL", "https://www.freelancermap.com/my_account.html")
             validated = self._validated_navigation_url(account_url)
             self.driver.get(validated)
-            self._wait_for_page_load()
+            self._require_usable_page(
+                expected_kind="account",
+                requested_url=account_url,
+            )
             self.accept_cookie_banner()
 
             current = self.driver.current_url or ""
             if _is_login_url(current):
                 return AuthVerificationResult(authenticated=False, reason=f"Redirected to login page: {current}")
-
-            state = self._page_state()
-            if state.login_required:
-                return AuthVerificationResult(authenticated=False, reason="Login page detected")
-            if state.challenge_detected:
-                return AuthVerificationResult(authenticated=False, reason="CAPTCHA/MFA security challenge detected")
-            if state.error_detected:
-                return AuthVerificationResult(authenticated=False, reason="Page error/status detected")
-
-            # Check for password input fields
-            passwords = self.driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
-            if passwords:
-                return AuthVerificationResult(authenticated=False, reason="Login password field present on page")
 
             # Verify POSITIVE authenticated DOM markers (URL ALONE DOES NOT PROVE AUTHENTICATION)
             body = self._body_text().casefold()
@@ -568,11 +844,44 @@ class BrowserSession:
         except Exception as exc:
             return AuthVerificationResult(authenticated=False, reason=f"Authentication check failed with error: {exc}")
 
-    def is_logged_in(self) -> bool:
-        """Return True if the browser session appears authenticated.
+    def _apparently_past_login_gate(self) -> bool:
+        """Light, non-authoritative signal that the browser left the login form.
 
-        Checks whether the current page is NOT a login page and the
-        session has navigated past the login gate at least once.
+        Never treated as proof of authentication. It only decides when a
+        strong ACCOUNT_URL verification is worth performing so manual
+        login flows are not disturbed while the form is still displayed.
+        """
+        try:
+            if _is_login_url(self.driver.current_url or ""):
+                return False
+            state = self._page_state()
+            if state.login_required or state.challenge_detected:
+                return False
+            body = self._body_text()
+            if not body.strip():
+                return False
+            return state.ready
+        except Exception:
+            return False
+
+    def _confirm_authenticated(self) -> bool:
+        """Authoritative post-login verification used by the login flows.
+
+        Navigates to Config.ACCOUNT_URL, runs verify_authenticated_session(),
+        and requires a positive visible authenticated marker. A login
+        redirect, password form, CAPTCHA/MFA challenge, HTTP error, or a
+        missing account marker all return False.
+        """
+        return self.verify_authenticated_session().authenticated
+
+    def is_logged_in(self) -> bool:
+        """Return True if the browser session *appears* authenticated.
+
+        NON-AUTHORITATIVE: this heuristic only checks the current page and
+        never navigates to the account route, so it must not be used as the
+        success condition of any login flow. Use
+        :meth:`verify_authenticated_session` (or :meth:`_confirm_authenticated`)
+        for authentication-sensitive decisions.
         """
         try:
             current = self.driver.current_url or ""
@@ -597,7 +906,11 @@ class BrowserSession:
     def interactive_login(self, timeout_seconds: int = 600) -> bool:
         """Open a visible browser and wait for the user to log in manually.
 
-        Returns True if login was detected before the timeout.
+        Once the browser appears to have left the login form, the session
+        is verified authoritatively: navigate to Config.ACCOUNT_URL and
+        require a positive authenticated marker via
+        verify_authenticated_session(). Returns True only when that strong
+        check passes before the timeout.
         """
         try:
             login_url = getattr(Config, "LOGIN_URL", None)
@@ -605,23 +918,28 @@ class BrowserSession:
                 return False
             validated = self._validated_navigation_url(login_url)
             self.driver.get(validated)
-            self._wait_for_page_load()
+            self._wait_for_page_load(requested_url=login_url)
             deadline = time.monotonic() + timeout_seconds
             poll_interval = 2.0
             while time.monotonic() < deadline:
-                if self.is_logged_in():
-                    return True
+                if self._apparently_past_login_gate():
+                    if self._confirm_authenticated():
+                        return True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 time.sleep(min(poll_interval, remaining))
-            return self.is_logged_in()
+            return self._confirm_authenticated()
         except Exception as exc:
             LOGGER.warning("Interactive login failed: %s", exc)
             return False
 
     def login_with_credentials(self) -> bool:
         """Attempt to log in using credentials from Config.
+
+        The success condition is the authoritative account verification
+        (navigate to ACCOUNT_URL and require a positive authenticated
+        marker), never the page-local is_logged_in() heuristic.
 
         Returns True if login succeeded.
         """
@@ -636,9 +954,12 @@ class BrowserSession:
                 return False
             validated = self._validated_navigation_url(login_url)
             self.driver.get(validated)
-            self._wait_for_page_load()
-            if self.is_logged_in():
-                return True
+            self._wait_for_page_load(requested_url=login_url)
+            if not _is_login_url(self.driver.current_url or ""):
+                if self._confirm_authenticated():
+                    return True
+                self.driver.get(validated)
+                self._wait_for_page_load(requested_url=login_url)
             email_inputs = self.driver.find_elements(
                 By.CSS_SELECTOR,
                 "input[type='email'], input[name='email'], input[id*='email'], input[id*='login']",
@@ -696,45 +1017,83 @@ class BrowserSession:
                 submit_button.click()
             else:
                 password_field.submit()
-            self._wait_for_page_load()
+            self._wait_for_page_load(requested_url=login_url)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
-                if self.is_logged_in():
+                if self._confirm_authenticated():
                     return True
                 time.sleep(2)
-            return self.is_logged_in()
+            return self._confirm_authenticated()
         except Exception as exc:
             LOGGER.warning("Credential login failed: %s", exc)
             return False
 
-    def _wait_for_page_load(self, timeout: float | None = None) -> None:
-        """Wait for the page to reach a ready state."""
+    def _wait_for_page_load(
+        self,
+        timeout: float | None = None,
+        *,
+        requested_url: str = "",
+    ) -> None:
+        """Wait for the page to reach a ready state.
+
+        Raises PageLoadTimeoutError when document.readyState never becomes
+        ``complete`` (including when execute_script keeps raising) before
+        the configured timeout. The message includes the requested or
+        final URL and the timeout duration, never the page HTML or any
+        credentials.
+        """
         timeout = timeout or Config.PAGE_LOAD_TIMEOUT
         deadline = time.monotonic() + timeout
+        last_state: str | None = None
         while time.monotonic() < deadline:
             try:
                 state = self.driver.execute_script("return document.readyState")
-                if state == "complete":
+                last_state = str(state or "")
+                if last_state == "complete":
                     return
             except Exception:
-                pass
-            time.sleep(0.5)
+                last_state = None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.5, remaining))
+
+        location = requested_url
+        if not location:
+            try:
+                location = self.driver.current_url or ""
+            except Exception:
+                location = ""
+        raise PageLoadTimeoutError(
+            "Page did not reach a ready state "
+            f"(readyState={last_state or 'unknown'}) within "
+            f"{timeout:.0f}s: {location or '(URL unavailable)'}"
+        )
 
     def scroll_to_bottom(self, max_scrolls: int | None = None) -> None:
-        """Scroll to page bottom to trigger lazy-loaded content."""
+        """Scroll to page bottom to trigger lazy-loaded content.
+
+        Scrolling continues while the document height, the project-route
+        count, or the visible loading indicators are still changing. It
+        stops only when all three are unchanged, so a single unchanged
+        height measurement never truncates a listing that is still
+        growing.
+        """
         max_scrolls = max_scrolls or Config.MAX_SCROLLS_PER_PAGE
+        previous_route_count = self._project_route_count()
         for _ in range(max_scrolls):
             try:
-                prev_height = self.driver.execute_script(
-                    "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
-                )
+                prev_height = self._document_height()
                 self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(Config.SCROLL_PAUSE_SECONDS)
-                new_height = self.driver.execute_script(
-                    "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
-                )
-                if new_height == prev_height:
+                new_height = self._document_height()
+                route_count = self._project_route_count()
+                loader_visible = self._visible_loading_indicator()
+                height_unchanged = new_height == prev_height
+                routes_stable = route_count == previous_route_count
+                if height_unchanged and routes_stable and not loader_visible:
                     break
+                previous_route_count = route_count
             except Exception:
                 break
 
@@ -781,4 +1140,7 @@ class BrowserSession:
         """Navigate to a validated URL."""
         validated = self._validated_navigation_url(url)
         self.driver.get(validated)
-        self._wait_for_page_load()
+        self._require_usable_page(
+            expected_kind="generic",
+            requested_url=url,
+        )

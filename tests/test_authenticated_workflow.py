@@ -65,6 +65,36 @@ class FakeDriver:
         elif self.mode == "rate_limit":
             self.title = "429 Too Many Requests"
             self.page_source = "<html><body>429 Rate Limit</body></html>"
+        elif self.mode == "blank":
+            self.title = "Freelancermap"
+            self.page_source = "<html><body></body></html>"
+        elif self.mode == "public":
+            self.title = "Freelancermap Projects"
+            self.page_source = "<html><body><p>Projects available</p></body></html>"
+        elif self.mode == "account_no_marker":
+            self.title = "Freelancermap Account Area"
+            self.page_source = "<html><body><p>Account area settings</p></body></html>"
+        elif self.mode == "maintenance":
+            self.title = "Temporarily unavailable"
+            self.page_source = "<html><body><p>Temporarily unavailable maintenance</p></body></html>"
+        elif self.mode == "logout_marker":
+            self.title = "Freelancermap Account Dashboard"
+            self.page_source = (
+                "<html><body><p>Account area</p>"
+                "<a href='/logout'>Logout</a></body></html>"
+            )
+        elif self.mode == "user_menu_marker":
+            self.title = "Freelancermap Account Dashboard"
+            self.page_source = (
+                "<html><body><p>My Freelancermap profile settings</p>"
+                "<div data-id='user-menu'></div></body></html>"
+            )
+        elif self.mode == "dashboard_marker":
+            self.title = "Freelancermap Account Dashboard"
+            self.page_source = (
+                "<html><body><h1>Account Dashboard</h1>"
+                "<p>Overview of your profile</p></body></html>"
+            )
         elif "my_account" in url:
             self.title = "Freelancermap Account Dashboard"
             self.page_source = (
@@ -99,9 +129,13 @@ class FakeDriver:
 
     def find_elements(self, by, value):
         if "logout" in value or "abmelden" in value:
-            elem = MagicMock()
-            elem.is_displayed.return_value = True
-            return [elem]
+            if self.mode in ("account", "logout_marker", "user_menu_marker", "dashboard_marker"):
+                elem = MagicMock()
+                elem.is_displayed.return_value = True
+                return [elem]
+            return []
+        if "email" in value:
+            return [MagicMock()]
         if "sort-option" in value or ("data-value" in value and "active" in value):
             if self.sort_state is not None:
                 elem = MagicMock()
@@ -113,6 +147,7 @@ class FakeDriver:
             if self.load_more:
                 elem = MagicMock()
                 elem.is_displayed.return_value = True
+                elem.click.side_effect = lambda: self._load_more_batch_added()
                 return [elem]
             return []
         if "password" in value:
@@ -127,7 +162,6 @@ class FakeDriver:
             return "complete"
         if "routes = new Set" in script or "routes.size" in script:
             self.route_calls += 1
-            self.route_count += self.route_growth
             return self.route_count
         if "scrollHeight" in script and "Math.max" in script:
             self.scroll_calls += 1
@@ -145,11 +179,29 @@ class FakeDriver:
                 return "Verify you are human captcha security check"
             if self.mode == "login":
                 return "Log in Sign in"
+            if self.mode == "blank":
+                return ""
+            if self.mode == "public":
+                return "Projects available"
+            if self.mode == "account_no_marker":
+                return "Account area settings"
+            if self.mode == "maintenance":
+                return "Temporarily unavailable maintenance"
+            if self.mode == "logout_marker":
+                return "Account area Logout"
+            if self.mode == "user_menu_marker":
+                return "My Freelancermap profile settings"
+            if self.mode == "dashboard_marker":
+                return "Account Dashboard overview"
             return "Dashboard My Freelancermap Logout Abmelden"
         return None
 
     def quit(self):
         pass
+
+    def _load_more_batch_added(self):
+        """Simulate one load-more batch: the project-route count grows."""
+        self.route_count += self.route_growth
 
 
 class AuthenticatedWorkflowTests(unittest.TestCase):
@@ -223,7 +275,11 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
         session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="login"))
         res = session.verify_authenticated_session()
         self.assertFalse(res.authenticated)
-        self.assertIn("login", res.reason.casefold())
+        self.assertTrue(res.reason)
+        self.assertIn(
+            "password form",
+            res.reason.casefold(),
+        )
 
     def test_12_password_form_fails(self):
         session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="login"))
@@ -275,7 +331,10 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
         session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, load_more=True, route_growth=1))
         session.click_load_more = MagicMock(wraps=session.click_load_more)
         with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01), \
-             patch.object(Config, "MAX_LOAD_MORE_CLICKS", 3):
+             patch.object(Config, "MAX_LOAD_MORE_CLICKS", 3), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 5), \
+             patch.object(Config, "LISTING_STABLE_ROUNDS", 2):
             html = session.load_listing_page("https://www.freelancermap.com/projects?sort=1")
         self.assertEqual(session.click_load_more.call_count, 3)
         self.assertIn("unit-test-proj", html)
@@ -292,10 +351,12 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
         with patch.object(Config, "PRIMARY_SEARCH_URL", url), \
              patch.object(Config, "MAX_PAGES", 3), \
              patch.object(Config, "ENABLE_PERSONALIZED_FEED", False), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 10), \
              patch.object(session, "next_page_url", return_value=url):
             outcome = _discover(session, scan_at="2026-07-31T00:00:00Z")
         self.assertIsInstance(outcome.projects, list)
-        self.assertEqual(session.driver.route_calls, 2)
+        self.assertGreaterEqual(session.driver.route_calls, 2)
 
     def test_24_primary_filtered_url_preserved(self):
         url = "https://www.freelancermap.com/projects?sort=date_desc&kw=python"
@@ -332,7 +393,9 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
     def test_28_secondary_only_project_ignored_when_personalized_discovery_false(self):
         with patch.object(Config, "ENABLE_PERSONALIZED_FEED", True), \
              patch.object(Config, "PERSONALIZED_FEED_DISCOVERY", False), \
-             patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=relevant"):
+             patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=relevant"), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 10):
             session = BrowserSession(driver_factory=FakeDriver)
             outcome = _discover(session, scan_at="2026-07-31T00:00:00Z")
             self.assertIsInstance(outcome.projects, list)
@@ -342,7 +405,9 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
     def test_29_secondary_only_project_accepted_when_personalized_discovery_true(self):
         with patch.object(Config, "ENABLE_PERSONALIZED_FEED", True), \
              patch.object(Config, "PERSONALIZED_FEED_DISCOVERY", True), \
-             patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=relevant"):
+             patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=relevant"), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 10):
             session = BrowserSession(driver_factory=FakeDriver)
             outcome = _discover(session, scan_at="2026-07-31T00:00:00Z")
             self.assertIsInstance(outcome.projects, list)
@@ -355,7 +420,9 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
              patch.object(Config, "ENABLE_PERSONALIZED_FEED", False), \
              patch.object(Config, "MAX_PAGES", 1), \
              patch.object(Config, "FEED_QUERY_SORT_PARAM", "sort"), \
-             patch.object(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1"):
+             patch.object(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1"), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 10):
             _discover(session, scan_at="2026-07-31T00:00:00Z")
         current = session.driver.current_url
         self.assertIn("sort=1", current)
@@ -368,7 +435,9 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
              patch.object(Config, "ENABLE_PERSONALIZED_FEED", False), \
              patch.object(Config, "MAX_PAGES", 1), \
              patch.object(Config, "FEED_QUERY_SORT_PARAM", "sort"), \
-             patch.object(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1"):
+             patch.object(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1"), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 10):
             _discover(session, scan_at="2026-07-31T00:00:00Z")
         self.assertEqual(
             "https://www.freelancermap.com/projects?sort=1",
@@ -385,7 +454,9 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
              patch.object(Config, "PERSONALIZED_SEARCH_URL", personalized), \
              patch.object(Config, "MAX_PAGES", 1), \
              patch.object(Config, "FEED_QUERY_SORT_PARAM", "sort"), \
-             patch.object(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1"):
+             patch.object(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1"), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 10):
             _discover(session, scan_at="2026-07-31T00:00:00Z")
         self.assertEqual(personalized, session.driver.current_url)
 
@@ -494,7 +565,9 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
             validate_detail(detail)
 
     def test_37_existing_single_feed_configurations_remain_compatible(self):
-        with patch.object(Config, "ENABLE_PERSONALIZED_FEED", False):
+        with patch.object(Config, "ENABLE_PERSONALIZED_FEED", False), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 10):
             session = BrowserSession(driver_factory=FakeDriver)
             outcome = _discover(session, scan_at="2026-07-31T00:00:00Z")
             self.assertIsInstance(outcome.projects, list)
@@ -575,7 +648,9 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
 
     def test_42_listing_page_rejects_mismatched_sort_state(self):
         session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, sort_state="2"))
-        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 10):
             with self.assertRaises(Exception):
                 session.load_listing_page(
                     "https://www.freelancermap.com/projects?sort=1",
@@ -584,12 +659,178 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
 
     def test_43_listing_page_accepts_newest_sort_state(self):
         session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, sort_state="1"))
-        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01):
+        with patch.object(Config, "SCROLL_PAUSE_SECONDS", 0.01), \
+             patch.object(Config, "LISTING_STABILITY_POLL_SECONDS", 0.01), \
+             patch.object(Config, "PAGE_LOAD_TIMEOUT", 10):
             html = session.load_listing_page(
                 "https://www.freelancermap.com/projects?sort=1",
                 expected_sort="1",
             )
         self.assertIn("unit-test-proj", html)
+
+
+class AdvancingClock:
+    """Test clock: every monotonic() call advances one second; sleep is a no-op."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        self.now += 1.0
+        return self.now
+
+    def sleep(self, _seconds):
+        return None
+
+
+class StrongAuthenticationVerificationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def test_44_blank_page_never_counts_as_authenticated(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="blank"))
+        res = session.verify_authenticated_session()
+        self.assertFalse(res.authenticated)
+        self.assertTrue(res.reason)
+
+    def test_45_public_unauthenticated_page_never_counts_as_authenticated(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="public"))
+        res = session.verify_authenticated_session()
+        self.assertFalse(res.authenticated)
+        self.assertIn("marker", res.reason.casefold())
+
+    def test_46_account_like_page_without_positive_marker_fails(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="account_no_marker"))
+        res = session.verify_authenticated_session()
+        self.assertFalse(res.authenticated)
+        self.assertIn("marker", res.reason.casefold())
+
+    def test_47_maintenance_page_never_counts_as_authenticated(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="maintenance"))
+        res = session.verify_authenticated_session()
+        self.assertFalse(res.authenticated)
+        self.assertTrue(res.reason)
+
+    def test_48_logout_marker_confirms_authentication(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="logout_marker"))
+        res = session.verify_authenticated_session()
+        self.assertTrue(res.authenticated)
+
+    def test_49_user_menu_marker_confirms_authentication(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="user_menu_marker"))
+        res = session.verify_authenticated_session()
+        self.assertTrue(res.authenticated)
+
+    def test_50_account_dashboard_marker_confirms_authentication(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="dashboard_marker"))
+        res = session.verify_authenticated_session()
+        self.assertTrue(res.authenticated)
+
+    def test_51_interactive_login_requires_strong_verification(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="login"))
+        with patch("browser.time", AdvancingClock()):
+            result = session.interactive_login(timeout_seconds=600)
+        self.assertFalse(result)
+
+    def test_52_interactive_login_succeeds_with_positive_marker(self):
+        session = BrowserSession(driver_factory=FakeDriver)
+        with patch("browser.time", AdvancingClock()), patch.object(
+            BrowserSession,
+            "is_logged_in",
+            side_effect=AssertionError("login flows must not use is_logged_in()"),
+        ):
+            result = session.interactive_login(timeout_seconds=5)
+        self.assertTrue(result)
+
+    def test_53_credential_login_succeeds_with_positive_marker(self):
+        session = BrowserSession(driver_factory=FakeDriver)
+        with patch("browser.time", AdvancingClock()), patch.object(
+            Config, "LOGIN_EMAIL", "test@example.com"
+        ), patch.object(Config, "LOGIN_PASSWORD", "s3cret"), patch.object(
+            BrowserSession,
+            "is_logged_in",
+            side_effect=AssertionError("login flows must not use is_logged_in()"),
+        ):
+            result = session.login_with_credentials()
+        self.assertTrue(result)
+
+    def test_54_credential_login_fails_without_positive_marker(self):
+        session = BrowserSession(driver_factory=lambda opt: FakeDriver(opt, mode="public"))
+        with patch("browser.time", AdvancingClock()), patch.object(
+            Config, "LOGIN_EMAIL", "test@example.com"
+        ), patch.object(Config, "LOGIN_PASSWORD", "s3cret"):
+            result = session.login_with_credentials()
+        self.assertFalse(result)
+
+    def test_55_expired_login_after_initial_check_aborts_cycle(self):
+        from browser import HttpError
+
+        class ExpiredSessionBrowser:
+            def __init__(self, headless=None):
+                self.headless = headless
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def verify_authenticated_session(self):
+                return AuthVerificationResult(authenticated=True, reason="OK")
+
+            def load_listing_page(self, url, *, expected_sort=None):
+                raise HttpError(
+                    "Navigated to a login page when protected content was expected"
+                )
+
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_expired.db"
+            lock_path = Path(folder) / "test_expired.lock"
+            with patch.object(database, "DATABASE_PATH", db_path), \
+                 patch.object(Config, "LOCK_PATH", lock_path), \
+                 patch.object(Config, "REQUIRE_LOGIN", True), \
+                 patch.object(Config, "EMPTY_RESULT_RETRIES", 0), \
+                 patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"), \
+                 patch("monitor.exclusive_file_lock"), \
+                 patch("monitor.BrowserSession", ExpiredSessionBrowser):
+                database.initialize_database()
+                with self.assertRaises(RuntimeError):
+                    run_cycle(dry_run=False, force_baseline=True, headless=True)
+                with database.connection() as conn:
+                    running = conn.execute(
+                        "SELECT COUNT(*) AS c FROM scans WHERE status='running'"
+                    ).fetchone()["c"]
+                    total = conn.execute(
+                        "SELECT COUNT(*) AS c FROM scans"
+                    ).fetchone()["c"]
+                self.assertEqual(0, running)
+                self.assertEqual(1, total)
+
+    def test_56_baseline_initializing_cleared_after_auth_failure(self):
+        def unauth_factory(options):
+            return FakeDriver(options, mode="login")
+
+        with tempfile.TemporaryDirectory() as folder:
+            db_path = Path(folder) / "test_auth_cleanup.db"
+            lock_path = Path(folder) / "test_auth_cleanup.lock"
+            with patch.object(database, "DATABASE_PATH", db_path), \
+                 patch.object(Config, "LOCK_PATH", lock_path), \
+                 patch.object(Config, "REQUIRE_LOGIN", True), \
+                 patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"), \
+                 patch("monitor.exclusive_file_lock"), \
+                 patch("monitor.BrowserSession", lambda **kw: BrowserSession(driver_factory=unauth_factory)):
+                database.initialize_database()
+                with self.assertRaises(RuntimeError):
+                    run_cycle(dry_run=False, force_baseline=True, headless=True)
+                self.assertEqual(
+                    "false",
+                    database.get_setting("baseline_initializing", "false"),
+                )
+                self.assertEqual(
+                    "",
+                    database.get_setting("baseline_started_at", "false"),
+                )
 
 
 if __name__ == "__main__":

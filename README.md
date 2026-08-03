@@ -2,7 +2,8 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Build Status](https://img.shields.io/badge/tests-172%20passed-brightgreen.svg)]()
+[![CI](https://github.com/Paramount-Intelligence/freelancermap-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/Paramount-Intelligence/freelancermap-monitor/actions/workflows/ci.yml)
+[![tests: 299 passed](https://img.shields.io/badge/tests-299%20passed-brightgreen.svg)]()
 [![Code Architecture](https://img.shields.io/badge/architecture-modular-orange.svg)]()
 
 A robust, local Python monitoring tool for **Freelancermap** project listings. It automatically discovers new projects from one or two search feeds, extracts detailed assignment parameters using deep DOM and JSON-LD parsing, persists structured data alongside compressed raw HTML in SQLite, and delivers HTML email digests for newly published projects.
@@ -14,7 +15,7 @@ A robust, local Python monitoring tool for **Freelancermap** project listings. I
 - **Automated Listing & Detail Discovery**: Periodically scans listing pages using Selenium WebDriver to capture dynamic cards, modal overlays, and React JSON state.
 - **Resilient Parsing Engine**: Resiliently extracts title, company, location, workload, rate, duration, start date, contract type, workplace model, skills, and full project descriptions.
 - **Preserves Critical Qualifiers**: Retains contract and rate qualifiers (e.g. `"6 months initial contract"`, `"€500/day (Outside IR35)"`) without premature truncation.
-- **ACID-Compliant SQLite Storage (Schema 9)**: Atomic upserts deduplicate listings by canonical URL and `source_key` while maintaining full snapshot and observation histories and dual-feed provenance.
+- **ACID-Compliant SQLite Storage (Schema 10)**: Atomic upserts deduplicate listings by canonical URL and `source_key` while maintaining full snapshot and observation histories, dual-feed provenance, and per-scan feed-status records.
 - **Dual-Feed Discovery**: Optionally scans a second (personalized/relevant) feed; projects are merged by canonical URL, enriched from whichever feed carries richer data, and their provenance (`seen_in_primary`, `seen_in_personalized`, positions, `discovery_sources_json`) is persisted per row.
 - **Authenticated Sessions**: Persistent Chrome profile keeps you logged in; the monitor verifies authentication through positive DOM markers (logout control / user menu), never by URL alone.
 - **HTML Email Digest**: Sends styled HTML email digests via SMTP (`SMTP_SSL` or `STARTTLS`) with XSS protection and strict transaction journaling.
@@ -30,7 +31,7 @@ A robust, local Python monitoring tool for **Freelancermap** project listings. I
 flowchart TD
     A[Freelancermap Website] -->|Selenium / Chrome| B(BrowserSession)
     B -->|Raw Listing & Detail HTML| C(Parser Engine)
-    C -->|ProjectDiscovery & Detail| D[(SQLite Database v9)]
+    C -->|ProjectDiscovery & Detail|     D[(SQLite Database v10)]
     D -->|New Pending Projects| E(Emailer Engine)
     E -->|SMTP / TLS| F[Email Recipients]
 ```
@@ -87,7 +88,7 @@ Every project record captures the following structured fields:
 | **`workload`** | Expected capacity | `"Full-time"`, `"80%"` |
 | **`posted_at`** | Verified posting UTC timestamp | `"2026-07-30T23:38:00+00:00"` |
 
-Feed provenance (schema 9):
+Feed provenance (schema 10):
 
 | Field Name | Description |
 | :--- | :--- |
@@ -96,6 +97,19 @@ Feed provenance (schema 9):
 | **`primary_position`** | First-seen position in the primary feed |
 | **`personalized_position`** | First-seen position in the secondary feed |
 | **`discovery_sources_json`** | Accumulated source labels (e.g. `["primary_newest", "personalized_relevant"]`) |
+
+Every scan record additionally persists its **feed status**:
+
+| Field Name | Description |
+| :--- | :--- |
+| **`primary_feed_status`** | Outcome of the primary feed load (`ok`, `failed`, `empty`, or `not_configured`) |
+| **`personalized_feed_status`** | Outcome of the secondary feed load (`ok`, `failed`, `empty`, `skipped`, or `not_configured`) |
+| **`degraded`** | Flag: the cycle completed while one feed was unavailable |
+| **`degraded_reason`** | Human-readable explanation for the degraded state |
+| **`primary_count`** | Number of project cards parsed from the primary feed |
+| **`personalized_count`** | Number of project cards parsed from the secondary feed |
+| **`personalized_only_count`** | Cards seen only in the secondary feed |
+| **`ignored_personalized_only_count`** | Secondary-only cards not stored because `PERSONALIZED_FEED_DISCOVERY=false` |
 
 ---
 
@@ -187,10 +201,10 @@ python main.py --show-search-configuration
 
 ## Testing & Reliability Engineering
 
-The repository includes a comprehensive, 100% green test suite:
+Every push and pull request is verified automatically by the [CI pipeline](https://github.com/Paramount-Intelligence/freelancermap-monitor/actions/workflows/ci.yml) on **8 jobs** (Python 3.10–3.13 × Ubuntu + Windows). Each job runs a 10-step pipeline: dependency installation, `pip check`, bytecode compilation, the complete unit-test suite, the static source-integrity audit, and the isolated synthetic end-to-end smoke test. A red pipeline blocks merging — the repository is never advertised as green on locally-only runs.
 
 ```bash
-# Run complete test suite (172 tests passing)
+# Run complete test suite (299 tests passing)
 python -m unittest discover -s tests -v
 
 # Run property-based 1,000-input fuzz testing
@@ -199,11 +213,15 @@ python -m unittest tests/test_parser_fuzz.py
 # Run adversarial edge-case test suite
 python -m unittest tests/test_adversarial_parser.py
 
-# Run isolated 3-cycle end-to-end smoke test
+# Run the static source-integrity audit (syntax, imports, driver-construction)
+python scripts/check_source_integrity.py
+
+# Run the synthetic 3-cycle end-to-end smoke test (no real network access)
 python smoke_test.py
 ```
 
-- **172 Unit Tests**: 100% passing rate across database, emailer, parser, browser, and monitor modules — including dual-feed merge/precedence/provenance, authentication gating, baseline safety, sort enforcement, pagination loops, and profile-lock cleanup.
+- **299 Unit Tests**: 100% passing rate across database, emailer, parser, browser, and monitor modules — including dual-feed merge/precedence/provenance, feed-status bookkeeping, authentication gating, first-run baseline safety, sort enforcement, listing-stability polling, page-load timeout fail-closed behavior, and profile-lock cleanup.
+- **Source-Integrity Audit**: The CI guard (`scripts/check_source_integrity.py`) parses every Python file, validates every import alias against stdlib / `requirements.txt` / local packages, and forbids direct browser-driver construction in tests (including aliased `webdriver.Chrome()` calls and `from selenium.webdriver import Chrome`). It is covered by its own unit suite (`tests/test_source_integrity.py`).
 - **Fuzz Testing**: 1,000 randomized malformed HTML inputs verifying 8 critical invariants.
 - **Adversarial Suite**: 22 edge-case tests protecting against prose label pollution, split DOM nodes, and hidden modals.
 

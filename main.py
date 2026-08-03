@@ -489,6 +489,9 @@ def test_browser(
 
         listing_html = browser.load_listing_page(
             listing_url,
+            expected_sort=str(
+                getattr(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1")
+            ),
         )
 
         projects = parse_project_links(
@@ -542,13 +545,6 @@ def test_browser(
 
     print(
         f"Primary feed URL       : {listing_url}"
-    )
-
-    print(
-        "Newest-first sort      : "
-        f"{getattr(Config, 'FEED_QUERY_SORT_PARAM', 'sort')}="
-        f"{getattr(Config, 'PRIMARY_FEED_NEWEST_SORT_VALUE', '1')} "
-        "(confirmed in query string)"
     )
 
     print(

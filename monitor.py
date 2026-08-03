@@ -148,13 +148,9 @@ def _run_cycle(
     database.initialize_database()
     _reconcile_accepted_email_receipts()
 
-    scan_at = utc_now_iso()
-    scan_id = database.create_scan()
-    result = CycleResult()
-
     baseline_initializing = _setting_bool("baseline_initializing")
     baseline_initialized = _baseline_initialized()
-    result.baseline = bool(
+    baseline_needed = bool(
         force_baseline
         or baseline_initializing
         or (
@@ -163,11 +159,24 @@ def _run_cycle(
         )
     )
 
-    if not result.baseline and not baseline_initialized and not bool(getattr(Config, "AUTO_BASELINE_ON_FIRST_RUN", False)):
+    # The first-run refusal happens BEFORE a scan row is created and before
+    # any baseline state is persisted or browser is started. A refused run
+    # must leave zero running scans, zero project mutations, zero baseline
+    # state changes, zero email attempts, and no browser startup.
+    if (
+        not baseline_needed
+        and not baseline_initialized
+        and not bool(getattr(Config, "AUTO_BASELINE_ON_FIRST_RUN", False))
+    ):
         raise RuntimeError(
             "Baseline is not initialized. Run: "
             "python main.py --initialize-baseline --visible"
         )
+
+    scan_at = utc_now_iso()
+    scan_id = database.create_scan()
+    result = CycleResult()
+    result.baseline = baseline_needed
 
     # Persist this state before inserting any cards. If Python, Chrome, Windows,
     # or the machine stops midway, the next run resumes baseline mode.
@@ -325,6 +334,22 @@ def _run_cycle(
                 category="cycle-failure",
                 error=exc,
             )
+
+        # A baseline attempt that failed before any project row was stored
+        # (authentication, configuration, listing, or browser-startup
+        # failure) must not leave baseline_initializing stuck on "true":
+        # the next run would otherwise resume a baseline that never stored
+        # anything. Nothing was mutated, so clear the markers and let the
+        # next run re-evaluate from scratch.
+        if result.baseline and not current_project_ids:
+            try:
+                _set_setting("baseline_initializing", "false")
+                _set_setting("baseline_started_at", "")
+            except Exception:
+                LOGGER.exception(
+                    "Could not clear baseline_initializing after an early "
+                    "baseline failure."
+                )
 
         _finish_scan_safely(
             scan_id,

@@ -456,6 +456,17 @@ class Config:
         maximum=10,
     )
 
+    # Poll interval between listing-stability measurements. Each round
+    # compares the project-route count, document height, visible loading
+    # indicators, and load-more availability; LISTING_STABLE_ROUNDS
+    # consecutive identical rounds are required before a listing is parsed.
+    LISTING_STABILITY_POLL_SECONDS = _env_float(
+        "LISTING_STABILITY_POLL_SECONDS",
+        0.5,
+        minimum=0.1,
+        maximum=60.0,
+    )
+
     SCROLL_PAUSE_SECONDS = _env_float(
         "SCROLL_PAUSE_SECONDS",
         2.0,
