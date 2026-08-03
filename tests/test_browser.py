@@ -329,5 +329,105 @@ class BrowserSessionEnhancedTests(unittest.TestCase):
                 pass
 
 
+class FakeConsentContainer:
+    """Minimal consent-banner container with clickable buttons."""
+
+    def __init__(self, buttons, *, displayed: bool = True) -> None:
+        self.buttons = buttons
+        self._displayed = displayed
+
+    def is_displayed(self) -> bool:
+        return self._displayed
+
+    def find_elements(self, by, value):
+        if value == "button, a[role='button'], a":
+            return self.buttons
+        return []
+
+
+class CookieConsentScopingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.driver_patch = patch.object(BrowserSession, "_ensure_driver", lambda self: setattr(self, "driver", FakeDriver()))
+        self.driver_patch.start()
+        self.addCleanup(self.driver_patch.stop)
+
+    def _session_with(self, elements) -> BrowserSession:
+        from selenium.webdriver.common.by import By
+
+        driver = FakeDriver(
+            elements={k: v for k, v in elements.items()}
+        )
+        session = BrowserSession(headless=True)
+        session.driver = driver  # type: ignore[assignment]
+        return session
+
+    def test_unrelated_accept_buttons_are_never_queried(self) -> None:
+        """Cookie acceptance must be scoped to consent containers."""
+        from selenium.webdriver.common.by import By
+
+        queries: list[str] = []
+        driver = FakeDriver()
+        original = driver.find_elements
+
+        def recording(by, value):
+            queries.append(value)
+            return original(by, value)
+
+        driver.find_elements = recording  # type: ignore[method-assign]
+        session = BrowserSession(headless=True)
+        session.driver = driver  # type: ignore[assignment]
+        session.accept_cookie_banner()
+        self.assertTrue(queries)
+        self.assertNotIn("button[class*='accept']", queries)
+        self.assertNotIn("button[id*='accept']", queries)
+        self.assertNotIn("a[class*='accept']", queries)
+        self.assertTrue(
+            all(
+                any(
+                    marker in query.casefold()
+                    for marker in ("cookie", "consent", "onetrust", "gdpr", "cc-banner")
+                )
+                for query in queries
+            ),
+            msg=f"unscoped selectors queried: {queries}",
+        )
+
+    def test_consent_banner_accept_button_is_clicked_once(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        accept = FakeElement(
+            element_id="accept-all",
+            attributes={"class": "cookie-consent-accept"},
+        )
+        accept.text = "Accept all cookies"
+        decline = FakeElement(element_id="decline")
+        decline.text = "Decline"
+        session = self._session_with(
+            {
+                (By.CSS_SELECTOR, "[class*='cookie-consent']"): [
+                    FakeConsentContainer([accept, decline])
+                ]
+            }
+        )
+        session.accept_cookie_banner()
+        self.assertTrue(accept.clicked)
+        self.assertFalse(decline.clicked)
+
+    def test_hidden_consent_banner_is_never_clicked(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        accept = FakeElement(element_id="accept-all")
+        accept.text = "Accept all cookies"
+        session = self._session_with(
+            {
+                (By.CSS_SELECTOR, "[class*='cookie-consent']"): [
+                    FakeConsentContainer([accept], displayed=False)
+                ]
+            }
+        )
+        session.accept_cookie_banner()
+        self.assertFalse(accept.clicked)
+
+
 if __name__ == "__main__":
     unittest.main()

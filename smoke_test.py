@@ -104,6 +104,7 @@ def run_smoke_test():
              patch.object(database, "DATABASE_PATH", db_path), \
              patch.object(Config, "LOCK_PATH", lock_path), \
              patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects?sort=1"), \
+             patch.object(Config, "SMTP_FROM_EMAIL", "smoke-test@example.com"), \
              patch.object(Config, "AUTO_BASELINE_ON_FIRST_RUN", True):
             
             # Step 1: Initialize fresh database
@@ -118,7 +119,8 @@ def run_smoke_test():
             )
 
             with patch("monitor.BrowserSession", browser_1), \
-                 patch("emailer._send") as mock_smtp_send:
+                 patch("emailer._send") as mock_smtp_send, \
+                 patch("emailer._validate_smtp"):
                 res1 = run_cycle(force_baseline=True)
                 print(f"Cycle 1 Result: baseline={res1.baseline}, discovered={res1.discovered}, new={res1.new}, emailed={res1.emailed}")
                 assert res1.baseline is True
@@ -142,7 +144,8 @@ def run_smoke_test():
                 return None
 
             with patch("monitor.BrowserSession", browser_2), \
-                 patch("emailer._send", side_effect=mock_send):
+                 patch("emailer._send", side_effect=mock_send), \
+                 patch("emailer._validate_smtp"):
                 res2 = run_cycle()
                 print(f"Cycle 2 Result: baseline={res2.baseline}, discovered={res2.discovered}, new={res2.new}, emailed={res2.emailed}")
                 assert res2.baseline is False
@@ -155,7 +158,8 @@ def run_smoke_test():
             # Step 9-10: Run Cycle 3 (Unchanged scan)
             print("\nStep 9: Running Cycle 3 (Unchanged scan)...")
             with patch("monitor.BrowserSession", browser_2), \
-                 patch("emailer._send") as mock_smtp_send:
+                 patch("emailer._send") as mock_smtp_send, \
+                 patch("emailer._validate_smtp"):
                 res3 = run_cycle()
                 print(f"Cycle 3 Result: baseline={res3.baseline}, discovered={res3.discovered}, new={res3.new}, emailed={res3.emailed}")
                 assert res3.baseline is False

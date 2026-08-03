@@ -17,7 +17,7 @@ from config import Config
 from emailer import send_test_email
 from monitor import CycleResult, run_cycle, validate_detail
 from parser import ProjectDiscovery, parse_project_detail, parse_project_links
-from utils import utc_now_iso
+from utils import ensure_query_param, utc_now_iso
 
 
 LOGGER = logging.getLogger(__name__)
@@ -152,6 +152,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reset failed detail pages to pending",
     )
 
+    action.add_argument(
+        "--reset-baseline",
+        action="store_true",
+        help=(
+            "Void the current baseline so the next cycle re-baselines; "
+            "requires --confirm-reset-baseline"
+        ),
+    )
+
+    parser.add_argument(
+        "--confirm-reset-baseline",
+        action="store_true",
+        help="Confirm a destructive baseline reset",
+    )
+
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -231,6 +246,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             return show_search_configuration()
 
         database.initialize_database()
+
+        if args.reset_baseline:
+            if not args.confirm_reset_baseline:
+                print(
+                    "Refusing to reset the baseline without confirmation. "
+                    "Re-run with --reset-baseline --confirm-reset-baseline."
+                )
+                return 1
+            changed = database.reset_baseline()
+            print(
+                f"Baseline voided; {changed} project row(s) re-marked as "
+                "baseline. The next cycle will re-baseline."
+            )
+            return 0
 
         if args.health_check:
             return health_check()
@@ -444,18 +473,22 @@ def test_browser(
     with BrowserSession(
         headless=headless_override(visible),
     ) as browser:
-        if (
-            Config.REQUIRE_LOGIN
-            and not browser.is_logged_in()
-        ):
-            raise RuntimeError(
-                "The configured project feed requires an "
-                "authenticated session. Run: "
-                "python main.py --interactive-login"
+        if Config.REQUIRE_LOGIN:
+            auth = browser.verify_authenticated_session()
+            if not auth.authenticated:
+                raise RuntimeError(
+                    "The configured project feed requires an "
+                    "authenticated session. Run: "
+                    "python main.py --interactive-login"
+                )
+            print(
+                f"Authenticated session  : yes ({auth.reason})"
             )
 
+        listing_url = primary_feed_url()
+
         listing_html = browser.load_listing_page(
-            Config.PROJECTS_URL,
+            listing_url,
         )
 
         projects = parse_project_links(
@@ -505,6 +538,17 @@ def test_browser(
 
     print(
         "Browser and parser test passed."
+    )
+
+    print(
+        f"Primary feed URL       : {listing_url}"
+    )
+
+    print(
+        "Newest-first sort      : "
+        f"{getattr(Config, 'FEED_QUERY_SORT_PARAM', 'sort')}="
+        f"{getattr(Config, 'PRIMARY_FEED_NEWEST_SORT_VALUE', '1')} "
+        "(confirmed in query string)"
     )
 
     print(
@@ -592,6 +636,29 @@ def test_browser(
     )
 
     return 0
+
+
+def primary_feed_url() -> str:
+    """Build the primary feed URL with the configured newest-first sort key.
+
+    The production discovery path always scans the primary feed with the
+    configured sort parameter. The returned URL is used by both ``_discover``
+    style scanning and ``--test-browser`` so the browser test proves the same
+    URL the monitor fetches.
+    """
+    url = str(
+        getattr(
+            Config,
+            "PRIMARY_SEARCH_URL",
+            "",
+        )
+        or Config.PROJECTS_URL
+    )
+    param = str(getattr(Config, "FEED_QUERY_SORT_PARAM", "sort")).strip()
+    value = str(getattr(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1")).strip()
+    if param and value:
+        url = ensure_query_param(url, param, value)
+    return url
 
 
 def run_once(
@@ -928,6 +995,13 @@ def print_recent_scans(
             f"emailed={row['emailed_count']}"
         )
 
+        print(
+            "   "
+            f"primary_feed={row_get(row, 'primary_feed_status', '')} | "
+            f"personalized_feed={row_get(row, 'personalized_feed_status', '')} | "
+            f"degraded={row_get(row, 'degraded', 0)}"
+        )
+
         if row["error"]:
             print(
                 "   error="
@@ -982,7 +1056,10 @@ def result_line(
         f"new={result.new}, "
         f"details_saved={result.detail_success}, "
         f"detail_failures={result.detail_failure}, "
-        f"emailed={result.emailed}"
+        f"emailed={result.emailed}, "
+        f"primary_feed={result.primary_feed_status}, "
+        f"personalized_feed={result.personalized_feed_status}, "
+        f"degraded={result.degraded}"
     )
 
 
@@ -1159,7 +1236,12 @@ def write_heartbeat(
             "detail_failure": result.detail_failure,
             "emailed": result.emailed,
             "baseline": result.baseline,
+            "primary_feed_status": result.primary_feed_status,
+            "personalized_feed_status": result.personalized_feed_status,
+            "degraded": result.degraded,
         }
+        if result.degraded_reason:
+            payload["cycle"]["degraded_reason"] = result.degraded_reason
 
     if error is not None:
         payload["error"] = {

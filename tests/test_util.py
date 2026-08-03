@@ -116,12 +116,12 @@ class UtilsEnhancedTests(unittest.TestCase):
             path = Path(directory) / "monitor.lock"
             with exclusive_file_lock(path):
                 self.assertTrue(path.exists())
-                metadata = path.read_text(encoding="utf-8")
-                self.assertIn('"pid":', metadata)
                 with self.assertRaises(RuntimeError):
                     with exclusive_file_lock(path):
                         pass
             self.assertTrue(path.exists())
+            metadata = path.read_text(encoding="utf-8")
+            self.assertIn('"pid":', metadata)
 
     def test_exclusive_file_lock_validates_wait_parameters(self):
         with tempfile.TemporaryDirectory() as directory:

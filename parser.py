@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
+from pagedetect import has_error_title
 from utils import canonicalize_url, normalize_space, source_key_from_url, stable_hash, utc_now_iso
 
 PROJECT_PATH_RE = re.compile(r"^/project/[^/?#]+/?$")
@@ -387,20 +388,7 @@ def parse_project_detail(
     if not detail.description:
         detail.description = normalize_space(meta.get("description") or meta.get("og:description"))
 
-    INVALID_TITLE_RE = re.compile(
-        r"(?:^|\b)(?:404|410|429|500|502|503)\b"
-        r"|not\s+found"
-        r"|page\s+does\s+not\s+exist"
-        r"|resource\s+is\s+gone"
-        r"|404\s+not\s+found",
-        re.I,
-    )
-    _GENERIC_TITLES = {
-        "find the perfect project", "freelance jobs", "it projects",
-        "sign in", "login", "forbidden", "access denied", "server error",
-        "404", "404 not found", "not found", "page does not exist", "resource is gone", "error"
-    }
-    if detail.title and (INVALID_TITLE_RE.search(detail.title) or any(marker in detail.title.casefold() for marker in _GENERIC_TITLES)):
+    if detail.title and has_error_title(detail.title):
         parser_meta["warnings"].append("missing_title")
         detail.title = ""
         detail.description = ""

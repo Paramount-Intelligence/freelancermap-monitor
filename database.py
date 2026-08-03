@@ -20,7 +20,7 @@ from utils import json_dumps, utc_now_iso
 LOGGER = logging.getLogger(__name__)
 
 DATABASE_PATH: Path = Config.DATABASE_PATH
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # SQLite's default host-parameter ceiling is commonly 999 on older builds.
 # Keeping each dynamic IN clause below 900 preserves broad Python/SQLite
@@ -172,6 +172,8 @@ def initialize_database() -> None:
             _repair_schema_v8(conn)
         if _get_schema_version(conn) < 9:
             _repair_schema_v9(conn)
+        if _get_schema_version(conn) < 10:
+            _repair_schema_v10(conn)
         _create_indexes(conn)
         conn.execute(
             """
@@ -600,6 +602,22 @@ def _repair_schema_v9(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "projects", "seen_in_personalized", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "projects", "primary_position", "INTEGER")
     _ensure_column(conn, "projects", "personalized_position", "INTEGER")
+
+
+def _repair_schema_v10(conn: sqlite3.Connection) -> None:
+    """Add per-scan feed status, degraded mode, and per-feed counts."""
+    scan_additions = {
+        "primary_feed_status": "TEXT NOT NULL DEFAULT ''",
+        "personalized_feed_status": "TEXT NOT NULL DEFAULT ''",
+        "degraded": "INTEGER NOT NULL DEFAULT 0",
+        "degraded_reason": "TEXT NOT NULL DEFAULT ''",
+        "primary_count": "INTEGER NOT NULL DEFAULT 0",
+        "personalized_count": "INTEGER NOT NULL DEFAULT 0",
+        "personalized_only_count": "INTEGER NOT NULL DEFAULT 0",
+        "ignored_personalized_only_count": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, declaration in scan_additions.items():
+        _ensure_column(conn, "scans", name, declaration)
 
 
 def _ensure_column(
@@ -1780,6 +1798,37 @@ def mark_all_as_baseline() -> int:
         return max(0, int(cursor.rowcount))
 
 
+def reset_baseline() -> int:
+    """Void the current baseline so the next cycle re-baselines.
+
+    Every project row is re-marked as baseline (sent rows keep their sent
+    state) so no historical project can be emailed between the reset and
+    the fresh baseline run. Settings are cleared atomically afterwards.
+
+    Returns the number of rows re-marked.
+    """
+    now = utc_now_iso()
+    with connection(write=True) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE projects SET
+                baseline = 1,
+                email_status = CASE
+                    WHEN email_status = 'sent' THEN 'sent' ELSE 'baseline' END,
+                email_next_retry_at = NULL,
+                updated_at = ?
+            WHERE email_status <> 'sent'
+            """,
+            (now,),
+        )
+        changed = max(0, int(cursor.rowcount))
+    set_setting("baseline_initialized", "false")
+    set_setting("baseline_initializing", "false")
+    set_setting("baseline_started_at", "")
+    set_setting("baseline_completed_at", "")
+    return changed
+
+
 def create_scan() -> int:
     with connection(write=True) as conn:
         cursor = conn.execute(
@@ -1798,19 +1847,38 @@ def finish_scan(scan_id: int, **values: Any) -> None:
         "detail_failure_count",
         "emailed_count",
         "error",
+        "primary_feed_status",
+        "personalized_feed_status",
+        "degraded",
+        "degraded_reason",
+        "primary_count",
+        "personalized_count",
+        "personalized_only_count",
+        "ignored_personalized_only_count",
     }
     clean = {key: value for key, value in values.items() if key in allowed}
     if "error" in clean:
         clean["error"] = _clean_error(str(clean["error"]), limit=8_000)
+    if "degraded_reason" in clean:
+        clean["degraded_reason"] = _clean_error(str(clean["degraded_reason"]), limit=2_000)
     for count_name in (
         "discovered_count",
         "new_count",
         "detail_success_count",
         "detail_failure_count",
         "emailed_count",
+        "primary_count",
+        "personalized_count",
+        "personalized_only_count",
+        "ignored_personalized_only_count",
     ):
         if count_name in clean:
             clean[count_name] = max(0, int(clean[count_name]))
+    if "degraded" in clean:
+        clean["degraded"] = 1 if bool(clean["degraded"]) else 0
+    for status_name in ("primary_feed_status", "personalized_feed_status"):
+        if status_name in clean:
+            clean[status_name] = str(clean[status_name]).strip()[:32]
     clean["finished_at"] = utc_now_iso()
 
     assignments = ", ".join(f"{key} = ?" for key in clean)

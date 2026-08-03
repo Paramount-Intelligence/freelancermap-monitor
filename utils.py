@@ -137,6 +137,23 @@ def canonicalize_url(url: str, base_url: str) -> str:
     return urlunsplit((scheme, netloc, path, "", ""))
 
 
+def ensure_query_param(url: str, name: str, value: str) -> str:
+    """Return the URL with ``name=value`` present exactly once in its query.
+
+    The parameter is appended when missing or replaced when already present,
+    so a feed URL always carries exactly one copy of the configured sort key.
+    """
+    raw = _clean_url_input(url, field_name="url")
+    parts = urlsplit(raw)
+    query = parts.query
+    if not name:
+        return urlunsplit(parts)
+    prefix = f"{name}="
+    entries = [entry for entry in query.split("&") if entry and not entry.startswith(prefix)]
+    entries.append(f"{name}={value}")
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(entries), parts.fragment))
+
+
 def source_key_from_url(url: str) -> str:
     """Return the final path segment, or a deterministic URL hash fallback.
 

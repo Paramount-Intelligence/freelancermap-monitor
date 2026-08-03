@@ -12,47 +12,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from sqlite3 import Row
 from typing import Any, Iterable, Sequence
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import database
 from browser import BrowserSession
 from config import Config
 from emailer import send_projects_email
+from pagedetect import has_error_title
 from parser import ProjectDetail, ProjectDiscovery, parse_project_detail, parse_project_links
-from utils import canonicalize_url, exclusive_file_lock, polite_sleep, utc_now_iso
+from utils import canonicalize_url, ensure_query_param, exclusive_file_lock, polite_sleep, utc_now_iso
 
 
 LOGGER = logging.getLogger(__name__)
 
 _PROJECT_PATH_RE = re.compile(r"^/project/[^/?#]+/?$", re.IGNORECASE)
-_INVALID_TITLE_RE = re.compile(
-    r"(?:^|\b)(?:404|410|429|500|502|503)\b"
-    r"|not\s+found"
-    r"|page\s+does\s+not\s+exist"
-    r"|resource\s+is\s+gone"
-    r"|404\s+not\s+found",
-    re.I,
-)
-_INVALID_TITLES = {
-    "access denied",
-    "attention required",
-    "checking your browser",
-    "error",
-    "forbidden",
-    "just a moment",
-    "log in",
-    "login",
-    "page not found",
-    "404",
-    "404 not found",
-    "not found",
-    "page does not exist",
-    "resource is gone",
-    "service unavailable",
-    "sign in",
-    "temporarily unavailable",
-    "verify you are human",
-}
 _FATAL_BROWSER_MARKERS = (
     "chrome not reachable",
     "disconnected: not connected to devtools",
@@ -94,6 +67,37 @@ class CycleResult:
     detail_failure: int = 0
     emailed: int = 0
     baseline: bool = False
+    primary_feed_status: str = "not_run"
+    personalized_feed_status: str = "not_configured"
+    degraded: bool = False
+    degraded_reason: str = ""
+    primary_count: int = 0
+    personalized_count: int = 0
+    personalized_only_count: int = 0
+    ignored_personalized_only_count: int = 0
+
+
+@dataclass(slots=True)
+class DiscoveryOutcome:
+    """Result of a discovery pass, including per-feed health."""
+
+    projects: list[ProjectDiscovery]
+    primary_feed_status: str = "ok"
+    personalized_feed_status: str = "not_configured"
+    primary_count: int = 0
+    personalized_count: int = 0
+    personalized_only_count: int = 0
+    ignored_personalized_only_count: int = 0
+    degraded: bool = False
+    degraded_reason: str = ""
+
+
+class PersonalizedFeedError(RuntimeError):
+    """The personalized feed failed while PERSONALIZED_FEED_REQUIRED=true."""
+
+    def __init__(self, message: str, outcome: DiscoveryOutcome) -> None:
+        super().__init__(message)
+        self.outcome = outcome
 
 
 def run_cycle(
@@ -177,7 +181,31 @@ def _run_cycle(
     try:
         with BrowserSession(headless=headless) as browser:
             _require_authenticated_session(browser)
-            discoveries = _discover(browser, scan_at=scan_at)
+            try:
+                outcome = _discover(browser, scan_at=scan_at)
+            except PersonalizedFeedError as exc:
+                result.primary_feed_status = exc.outcome.primary_feed_status
+                result.personalized_feed_status = exc.outcome.personalized_feed_status
+                result.degraded = exc.outcome.degraded
+                result.degraded_reason = exc.outcome.degraded_reason
+                result.primary_count = exc.outcome.primary_count
+                result.personalized_count = exc.outcome.personalized_count
+                result.personalized_only_count = exc.outcome.personalized_only_count
+                result.ignored_personalized_only_count = exc.outcome.ignored_personalized_only_count
+                raise
+            except Exception:
+                result.primary_feed_status = "failed"
+                raise
+
+            discoveries = outcome.projects
+            result.primary_feed_status = outcome.primary_feed_status
+            result.personalized_feed_status = outcome.personalized_feed_status
+            result.degraded = outcome.degraded
+            result.degraded_reason = outcome.degraded_reason
+            result.primary_count = outcome.primary_count
+            result.personalized_count = outcome.personalized_count
+            result.personalized_only_count = outcome.personalized_only_count
+            result.ignored_personalized_only_count = outcome.ignored_personalized_only_count
             result.discovered = len(discoveries)
 
             if not discoveries:
@@ -311,13 +339,27 @@ def _discover(
     browser: BrowserSession,
     *,
     scan_at: str,
-) -> list[ProjectDiscovery]:
-    """Load primary search feed and optional secondary feed, returning deduplicated cards."""
+) -> DiscoveryOutcome:
+    """Load primary search feed and optional secondary feed, returning deduplicated cards.
 
-    primary_url = _safe_same_origin_url(getattr(Config, "PRIMARY_SEARCH_URL", Config.PROJECTS_URL))
+    The primary feed is always required: a failed primary feed raises.  The
+    personalized feed is optional; when it fails and
+    ``PERSONALIZED_FEED_REQUIRED`` is false the cycle continues degraded,
+    otherwise a :class:`PersonalizedFeedError` is raised.
+    """
+
+    primary_url = _safe_same_origin_url(
+        ensure_query_param(
+            str(getattr(Config, "PRIMARY_SEARCH_URL", Config.PROJECTS_URL)),
+            str(getattr(Config, "FEED_QUERY_SORT_PARAM", "sort")),
+            str(getattr(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1")),
+        )
+    )
     by_url: dict[str, ProjectDiscovery] = {}
     seen_listing_urls: set[str] = set()
     max_pages = int(getattr(Config, "MAX_PAGES", 1))
+    outcome = DiscoveryOutcome(projects=[])
+    personalized_required = bool(getattr(Config, "PERSONALIZED_FEED_REQUIRED", False))
 
     # 1. Scan Primary Feed (Newest First)
     listing_url = primary_url
@@ -359,6 +401,7 @@ def _discover(
                 by_url[key] = merged
             else:
                 by_url[key] = project
+            outcome.primary_count += 1
 
         if page_number >= max_pages:
             break
@@ -382,44 +425,62 @@ def _discover(
     secondary_url = getattr(Config, "PERSONALIZED_SEARCH_URL", "").strip()
     allow_secondary_discovery = bool(getattr(Config, "PERSONALIZED_FEED_DISCOVERY", False))
 
-    if enable_secondary and secondary_url:
-        secondary_safe = _safe_same_origin_url(secondary_url)
-        LOGGER.info("Scanning optional secondary personalized feed: %s", secondary_safe)
-        try:
-            sec_projects = _load_listing_with_retries(
-                browser,
-                secondary_safe,
-                scan_at=scan_at,
-                page_number=1,
-            )
-            ignored_count = 0
-            for pos, sec_project in enumerate(sec_projects, 1):
-                try:
-                    _validate_discovery(sec_project)
-                except Exception:
-                    continue
-                setattr(sec_project, "_seen_in_personalized", True)
-                setattr(sec_project, "_personalized_position", pos)
-                key = canonicalize_url(sec_project.url, Config.BASE_URL)
-                if key in by_url:
-                    existing = by_url[key]
-                    merged = _richer_discovery(existing, sec_project)
-                    setattr(merged, "_seen_in_primary", getattr(existing, "_seen_in_primary", True))
-                    setattr(merged, "_primary_position", getattr(existing, "_primary_position", None))
-                    setattr(merged, "_seen_in_personalized", True)
-                    setattr(merged, "_personalized_position", pos)
-                    by_url[key] = merged
-                elif allow_secondary_discovery:
-                    setattr(sec_project, "_seen_in_primary", False)
-                    by_url[key] = sec_project
-                else:
-                    ignored_count += 1
-            if ignored_count > 0:
-                LOGGER.info("Ignored %d secondary-only personalized projects (PERSONALIZED_FEED_DISCOVERY=false).", ignored_count)
-        except Exception as exc:
-            LOGGER.warning("Secondary personalized feed scan encountered error: %s", _safe_error(exc))
+    if not (enable_secondary and secondary_url):
+        outcome.projects = list(by_url.values())
+        return outcome
 
-    return list(by_url.values())
+    secondary_safe = _safe_same_origin_url(secondary_url)
+    LOGGER.info("Scanning optional secondary personalized feed: %s", secondary_safe)
+    try:
+        sec_projects = _load_listing_with_retries(
+            browser,
+            secondary_safe,
+            scan_at=scan_at,
+            page_number=1,
+        )
+        ignored_count = 0
+        for pos, sec_project in enumerate(sec_projects, 1):
+            try:
+                _validate_discovery(sec_project)
+            except Exception:
+                continue
+            setattr(sec_project, "_seen_in_personalized", True)
+            setattr(sec_project, "_personalized_position", pos)
+            key = canonicalize_url(sec_project.url, Config.BASE_URL)
+            if key in by_url:
+                existing = by_url[key]
+                merged = _richer_discovery(existing, sec_project)
+                setattr(merged, "_seen_in_primary", getattr(existing, "_seen_in_primary", True))
+                setattr(merged, "_primary_position", getattr(existing, "_primary_position", None))
+                setattr(merged, "_seen_in_personalized", True)
+                setattr(merged, "_personalized_position", pos)
+                by_url[key] = merged
+            elif allow_secondary_discovery:
+                setattr(sec_project, "_seen_in_primary", False)
+                by_url[key] = sec_project
+                outcome.personalized_only_count += 1
+            else:
+                ignored_count += 1
+            outcome.personalized_count += 1
+        if ignored_count > 0:
+            LOGGER.info("Ignored %d secondary-only personalized projects (PERSONALIZED_FEED_DISCOVERY=false).", ignored_count)
+        outcome.ignored_personalized_only_count = ignored_count
+        outcome.personalized_feed_status = "ok"
+    except Exception as exc:
+        message = _safe_error(exc)
+        LOGGER.warning("Secondary personalized feed scan encountered error: %s", message)
+        outcome.personalized_feed_status = "failed"
+        outcome.degraded = True
+        outcome.degraded_reason = message
+        if personalized_required:
+            raise PersonalizedFeedError(
+                "The configured personalized feed failed while "
+                "PERSONALIZED_FEED_REQUIRED=true: " + message,
+                outcome,
+            ) from exc
+
+    outcome.projects = list(by_url.values())
+    return outcome
 
 
 def _load_listing_with_retries(
@@ -574,7 +635,7 @@ def validate_detail(
     """Reject login, block, unrelated, and incomplete pages before persistence."""
 
     title = str(detail.title or "").strip()
-    if not title or title.casefold() in _INVALID_TITLES or _INVALID_TITLE_RE.search(title):
+    if not title or has_error_title(title):
         raise DetailValidationError(
             "Project title was missing or looked like an access/login/error page."
         )
@@ -950,6 +1011,14 @@ def _finish_scan_safely(
             detail_failure_count=result.detail_failure,
             emailed_count=result.emailed,
             error=error,
+            primary_feed_status=result.primary_feed_status,
+            personalized_feed_status=result.personalized_feed_status,
+            degraded=result.degraded,
+            degraded_reason=result.degraded_reason,
+            primary_count=result.primary_count,
+            personalized_count=result.personalized_count,
+            personalized_only_count=result.personalized_only_count,
+            ignored_personalized_only_count=result.ignored_personalized_only_count,
         )
     except Exception:
         LOGGER.critical(
@@ -994,14 +1063,28 @@ def _reset_empty_scan_counter() -> None:
 
 
 def _safe_same_origin_url(value: str) -> str:
-    absolute = canonicalize_url(value, Config.BASE_URL)
+    """Resolve one HTTP(S) URL and verify it stays on the configured origin.
+
+    Unlike :func:`canonicalize_url` -- which strips query strings for project
+    deduplication -- this helper preserves the query string and fragment so the
+    configured search URLs keep their search query and newest-first sort keys.
+    """
+    clean = str(value or "").strip()
+    if not clean:
+        raise DiscoveryError("Empty URL rejected.")
+    if "://" not in clean:
+        absolute = urljoin(Config.BASE_URL, clean)
+    else:
+        absolute = clean
     parsed = urlparse(absolute)
     base = urlparse(Config.BASE_URL)
     if parsed.scheme.casefold() not in {"http", "https"}:
         raise DiscoveryError(f"Unsupported URL scheme: {value}")
+    if not parsed.netloc:
+        raise DiscoveryError(f"URL has no host: {value}")
     if parsed.netloc.casefold() != base.netloc.casefold():
         raise DiscoveryError(f"Cross-origin URL rejected: {value}")
-    return absolute
+    return urlunparse(parsed)
 
 
 def _safe_project_url(value: str) -> str:
@@ -1119,7 +1202,7 @@ def _capture_diagnostic(
             encoding="utf-8",
         )
 
-        if bool(getattr(Config, "DIAGNOSTIC_CAPTURE_HTML", True)):
+        if bool(getattr(Config, "DIAGNOSTIC_CAPTURE_HTML", False)):
             raw_html = str(getattr(driver, "page_source", "") or "")
             if bool(getattr(Config, "DIAGNOSTIC_REDACT_SENSITIVE_DATA", True)):
                 raw_html = _redact_html(raw_html)
@@ -1127,7 +1210,7 @@ def _capture_diagnostic(
             encoded = raw_html.encode("utf-8")[:max_bytes]
             (directory / f"{stem}.html").write_bytes(encoded)
 
-        if bool(getattr(Config, "DIAGNOSTIC_CAPTURE_SCREENSHOT", True)) and hasattr(
+        if bool(getattr(Config, "DIAGNOSTIC_CAPTURE_SCREENSHOT", False)) and hasattr(
             driver, "save_screenshot"
         ):
             driver.save_screenshot(str(directory / f"{stem}.png"))

@@ -21,6 +21,18 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from config import Config
+from pagedetect import (
+    ERROR_BODY_RE,
+    ERROR_TITLE_RE,
+    detect_challenge,
+    detect_error,
+    has_error_title,
+    is_login_url,
+)
+
+
+# Backwards-compatible alias for existing imports and call sites.
+_is_login_url = is_login_url
 
 
 LOGGER = logging.getLogger(__name__)
@@ -64,48 +76,7 @@ class HttpError(Exception):
     """Raised when an HTTP error status or page error is encountered."""
 
 
-LOGIN_PATH_RE = re.compile(r"/(?:login|sign-in)(?:/|$)", re.I)
-CHALLENGE_TITLE_RE = re.compile(
-    r"(?:just a moment|verify you are human|attention required|checking your browser|"
-    r"enable javascript|ray id|cloudflare|captcha|recaptcha challenge)",
-    re.I,
-)
-CHALLENGE_BODY_RE = re.compile(
-    r"(?:verify you are human|checking your browser|enable javascript|"
-    r"please wait|security check|access denied|ray id)",
-    re.I,
-)
-ERROR_TITLE_RE = re.compile(
-    r"(?<![£€$¥₹.,/\w])(?:404|410|429|500|502|503)\b"
-    r"|not\s+found"
-    r"|page\s+does\s+not\s+exist"
-    r"|resource\s+is\s+gone"
-    r"|service\s+unavailable|internal\s+server\s+error|bad\s+gateway|forbidden",
-    re.I,
-)
-ERROR_BODY_RE = re.compile(
-    r"(?<![£€$¥₹.,/\w])(?:404|410|429|500|502|503)\b"
-    r"|not\s+found"
-    r"|page\s+does\s+not\s+exist"
-    r"|resource\s+is\s+gone"
-    r"|service\s+unavailable|internal\s+server\s+error|bad\s+gateway|"
-    r"temporarily\s+unavailable|something\s+went\s+wrong|try\s+again\s+later",
-    re.I,
-)
 PROJECT_PATH_RE = re.compile(r"^/project/[^/?#]+$", re.I)
-RECAPTCHA_SCRIPT_ONLY_RE = re.compile(
-    r"<script[^>]+src=['\"]https?://[^'\"]*recaptcha[^\"]*['\"]",
-    re.I,
-)
-
-
-def _is_login_url(url: str) -> bool:
-    """Return True if the URL path indicates a login or sign-in page."""
-    try:
-        parsed = urlparse(url)
-        return bool(LOGIN_PATH_RE.search(parsed.path))
-    except Exception:
-        return False
 
 
 class BrowserSession:
@@ -147,6 +118,7 @@ class BrowserSession:
             options.add_argument("--headless=new")
         if bool(getattr(Config, "CHROME_NO_SANDBOX", False)):
             options.add_argument("--no-sandbox")
+        if bool(getattr(Config, "CHROME_DISABLE_DEV_SHM_USAGE", False)):
             options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1920,1080")
         
@@ -300,18 +272,11 @@ class BrowserSession:
 
             ready = self._is_page_ready(body_text)
 
-            # Challenge detection: visible human verification elements
-            challenge = bool(
-                CHALLENGE_TITLE_RE.search(title) or CHALLENGE_BODY_RE.search(body_text)
-            )
+            # Challenge detection uses shared pagedetect semantics: a lone
+            # recaptcha script tag or "please wait" is never a challenge.
+            challenge = detect_challenge(title, body_text, page_source)
 
-            # A recaptcha script tag alone is NOT a challenge; only the
-            # interactive challenge widget counts.
-            if challenge and not CHALLENGE_TITLE_RE.search(title):
-                if RECAPTCHA_SCRIPT_ONLY_RE.search(page_source) and not CHALLENGE_BODY_RE.search(body_text):
-                    challenge = False
-
-            error = bool(ERROR_TITLE_RE.search(title) or ERROR_BODY_RE.search(body_text))
+            error = detect_error(title, body_text)
 
             login_required = _is_login_url(self.driver.current_url)
 
@@ -364,25 +329,68 @@ class BrowserSession:
         return None
 
     def accept_cookie_banner(self) -> None:
-        """Attempt to accept cookie consent banners if present."""
+        """Attempt to accept cookie consent banners if present.
+
+        Only accept buttons inside an explicit consent container (a cookie
+        consent, OneTrust, or GDPR banner) are clicked.  An unrelated page
+        button whose class or id merely contains "accept" or "consent"
+        (e.g. an "Accept offer" button) is never touched.
+        """
         if not self.driver:
             return
-        selectors = [
-            "button[id*='accept']", "button[class*='accept']", "a[id*='accept']",
-            "button[id*='consent']", "button[class*='consent']",
-            "#onetrust-accept-btn-handler", ".cookie-consent-accept",
-            "button[data-testid='cookie-accept']"
-        ]
-        for sel in selectors:
-            try:
-                btns = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                for btn in btns:
-                    if btn.is_displayed():
-                        btn.click()
-                        time.sleep(0.5)
-                        return
-            except Exception:
-                continue
+        container_selectors = (
+            "#onetrust-banner-sdk",
+            "[id*='onetrust']",
+            "[class*='onetrust']",
+            "[class*='cookie-consent']",
+            "[class*='cookieConsent']",
+            "[class*='consent-banner']",
+            "[class*='consentBanner']",
+            "[class*='cc-banner']",
+            "[class*='cookie']",
+            "[id*='cookie-banner']",
+            "[class*='gdpr']",
+            "[data-testid='cookie-banner']",
+        )
+        accept_words = (
+            "accept",
+            "agree",
+            "allow",
+            "consent",
+            "confirm",
+            "zustimmen",
+            "einverstanden",
+            "ok",
+        )
+        try:
+            for selector in container_selectors:
+                containers = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for container in containers:
+                    if not container.is_displayed():
+                        continue
+                    try:
+                        buttons = container.find_elements(
+                            By.CSS_SELECTOR, "button, a[role='button'], a"
+                        )
+                    except Exception:
+                        buttons = []
+                    for button in buttons:
+                        try:
+                            if not button.is_displayed():
+                                continue
+                            label = (
+                                (button.get_attribute("aria-label") or "")
+                                + " "
+                                + (button.text or "")
+                            ).casefold()
+                            if any(word in label for word in accept_words):
+                                button.click()
+                                time.sleep(0.5)
+                                return
+                        except Exception:
+                            continue
+        except Exception:
+            return
 
     def get_project_page(self, url: str) -> str:
         """Navigate to a project detail page and return the page source HTML."""
@@ -397,7 +405,7 @@ class BrowserSession:
         state = self._page_state()
         if state.error_detected:
             title = (self.driver.title or "").strip()
-            if ERROR_TITLE_RE.search(title) or "404" in title or "not found" in title.casefold():
+            if has_error_title(title):
                 raise PageNotFoundError(f"Detail page {url} returned 404/Error: '{title}'")
             raise HttpError(f"Detail page {url} returned error state: '{title}'")
             
@@ -413,7 +421,7 @@ class BrowserSession:
         state = self._page_state()
         if state.error_detected:
             title = (self.driver.title or "").strip()
-            if ERROR_TITLE_RE.search(title) or "404" in title or "not found" in title.casefold():
+            if has_error_title(title):
                 raise PageNotFoundError(f"Page {url} returned 404/Error: '{title}'")
             raise HttpError(f"Page {url} returned error state: '{title}'")
             
@@ -492,7 +500,7 @@ class BrowserSession:
         state = self._page_state()
         if state.error_detected:
             title = (self.driver.title or "").strip()
-            if ERROR_TITLE_RE.search(title) or "404" in title or "not found" in title.casefold():
+            if has_error_title(title):
                 raise PageNotFoundError(f"Listing page {url} returned 404/Error: '{title}'")
             raise HttpError(f"Listing page {url} returned error state: '{title}'")
 

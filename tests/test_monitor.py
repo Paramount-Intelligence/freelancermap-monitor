@@ -75,7 +75,8 @@ class MonitorEnhancedTests(unittest.TestCase):
         with patch("monitor._baseline_initialized", return_value=False), patch(
             "monitor._setting_bool", return_value=False
         ), patch("monitor._set_setting") as setting, patch(
-            "monitor._discover", return_value=[self.discovery()]
+            "monitor._discover",
+            return_value=monitor.DiscoveryOutcome(projects=[self.discovery()]),
         ), patch(
             "monitor.database.upsert_discovery", return_value=(1, True)
         ), patch(
@@ -105,7 +106,8 @@ class MonitorEnhancedTests(unittest.TestCase):
         with patch("monitor._baseline_initialized", return_value=False), patch(
             "monitor._setting_bool", return_value=False
         ), patch("monitor._set_setting"), patch(
-            "monitor._discover", return_value=[]
+            "monitor._discover",
+            return_value=monitor.DiscoveryOutcome(projects=[]),
         ), patch.object(
             Config, "AUTO_BASELINE_ON_FIRST_RUN", True
         ), patch.object(
@@ -121,7 +123,12 @@ class MonitorEnhancedTests(unittest.TestCase):
 
         with patch("monitor._baseline_initialized", return_value=True), patch(
             "monitor._setting_bool", return_value=False
-        ), patch("monitor._discover", return_value=[self.discovery("one"), self.discovery("two")]), patch(
+        ), patch(
+            "monitor._discover",
+            return_value=monitor.DiscoveryOutcome(
+                projects=[self.discovery("one"), self.discovery("two")]
+            ),
+        ), patch(
             "monitor.database.upsert_discovery"
         ) as upsert, patch.object(
             Config, "AUTO_BASELINE_ON_FIRST_RUN", True
@@ -244,6 +251,30 @@ class MonitorEnhancedTests(unittest.TestCase):
                 monitor._reconcile_accepted_email_receipts()
             mark_sent.assert_called_once_with([4, 5], "<batch@example.com>")
             self.assertFalse(receipt.exists())
+
+    def test_safe_same_origin_url_preserves_query_string_and_fragment(self):
+        url = (
+            "https://www.freelancermap.com/projects"
+            "?excludeDachProjects=false&query=website+development&sort=1&pagenr=1"
+        )
+        self.assertEqual(
+            url,
+            monitor._safe_same_origin_url(url),
+        )
+        self.assertEqual(
+            "https://www.freelancermap.com/projects?sort=1#list",
+            monitor._safe_same_origin_url("https://www.freelancermap.com/projects?sort=1#list"),
+        )
+
+    def test_safe_same_origin_url_rejects_cross_origin(self):
+        with self.assertRaisesRegex(monitor.DiscoveryError, "Cross-origin"):
+            monitor._safe_same_origin_url("https://evil.example.com/projects")
+
+    def test_safe_same_origin_url_joins_relative_paths(self):
+        self.assertEqual(
+            "https://www.freelancermap.com/projects?sort=1",
+            monitor._safe_same_origin_url("/projects?sort=1"),
+        )
 
 
 if __name__ == "__main__":

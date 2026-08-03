@@ -293,8 +293,8 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
              patch.object(Config, "MAX_PAGES", 3), \
              patch.object(Config, "ENABLE_PERSONALIZED_FEED", False), \
              patch.object(session, "next_page_url", return_value=url):
-            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
-        self.assertIsInstance(discoveries, list)
+            outcome = _discover(session, scan_at="2026-07-31T00:00:00Z")
+        self.assertIsInstance(outcome.projects, list)
         self.assertEqual(session.driver.route_calls, 2)
 
     def test_24_primary_filtered_url_preserved(self):
@@ -334,16 +334,61 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
              patch.object(Config, "PERSONALIZED_FEED_DISCOVERY", False), \
              patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=relevant"):
             session = BrowserSession(driver_factory=FakeDriver)
-            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
-            self.assertIsInstance(discoveries, list)
+            outcome = _discover(session, scan_at="2026-07-31T00:00:00Z")
+            self.assertIsInstance(outcome.projects, list)
+            self.assertEqual("ok", outcome.personalized_feed_status)
+            self.assertEqual(1, outcome.personalized_count)
 
     def test_29_secondary_only_project_accepted_when_personalized_discovery_true(self):
         with patch.object(Config, "ENABLE_PERSONALIZED_FEED", True), \
              patch.object(Config, "PERSONALIZED_FEED_DISCOVERY", True), \
              patch.object(Config, "PERSONALIZED_SEARCH_URL", "https://www.freelancermap.com/projects?sort=relevant"):
             session = BrowserSession(driver_factory=FakeDriver)
-            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
-            self.assertIsInstance(discoveries, list)
+            outcome = _discover(session, scan_at="2026-07-31T00:00:00Z")
+            self.assertIsInstance(outcome.projects, list)
+            self.assertEqual("ok", outcome.personalized_feed_status)
+
+    def test_40_primary_feed_navigation_preserves_query_and_sort(self):
+        url = "https://www.freelancermap.com/projects?excludeDachProjects=false&query=website+development&sort=1&pagenr=1"
+        session = BrowserSession(driver_factory=FakeDriver)
+        with patch.object(Config, "PRIMARY_SEARCH_URL", url), \
+             patch.object(Config, "ENABLE_PERSONALIZED_FEED", False), \
+             patch.object(Config, "MAX_PAGES", 1), \
+             patch.object(Config, "FEED_QUERY_SORT_PARAM", "sort"), \
+             patch.object(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1"):
+            _discover(session, scan_at="2026-07-31T00:00:00Z")
+        current = session.driver.current_url
+        self.assertIn("sort=1", current)
+        self.assertIn("query=website+development", current)
+        self.assertEqual(1, current.count("sort="))
+
+    def test_41_primary_feed_navigation_appends_missing_sort_param(self):
+        session = BrowserSession(driver_factory=FakeDriver)
+        with patch.object(Config, "PRIMARY_SEARCH_URL", "https://www.freelancermap.com/projects"), \
+             patch.object(Config, "ENABLE_PERSONALIZED_FEED", False), \
+             patch.object(Config, "MAX_PAGES", 1), \
+             patch.object(Config, "FEED_QUERY_SORT_PARAM", "sort"), \
+             patch.object(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1"):
+            _discover(session, scan_at="2026-07-31T00:00:00Z")
+        self.assertEqual(
+            "https://www.freelancermap.com/projects?sort=1",
+            session.driver.current_url,
+        )
+
+    def test_42_personalized_feed_navigation_preserves_query(self):
+        primary = "https://www.freelancermap.com/projects?sort=1"
+        personalized = "https://www.freelancermap.com/projects?excludeDachProjects=false&query=automation&sort=1&pagenr=1"
+        session = BrowserSession(driver_factory=FakeDriver)
+        with patch.object(Config, "PRIMARY_SEARCH_URL", primary), \
+             patch.object(Config, "ENABLE_PERSONALIZED_FEED", True), \
+             patch.object(Config, "PERSONALIZED_FEED_DISCOVERY", False), \
+             patch.object(Config, "PERSONALIZED_SEARCH_URL", personalized), \
+             patch.object(Config, "MAX_PAGES", 1), \
+             patch.object(Config, "FEED_QUERY_SORT_PARAM", "sort"), \
+             patch.object(Config, "PRIMARY_FEED_NEWEST_SORT_VALUE", "1"):
+            _discover(session, scan_at="2026-07-31T00:00:00Z")
+        self.assertEqual(personalized, session.driver.current_url)
+
 
     def test_30_secondary_values_enrich_missing_primary_fields(self):
         p1 = ProjectDiscovery(source_key="enrich", slug="enrich", url="https://www.freelancermap.com/project/enrich", title_hint="Title")
@@ -451,11 +496,12 @@ class AuthenticatedWorkflowTests(unittest.TestCase):
     def test_37_existing_single_feed_configurations_remain_compatible(self):
         with patch.object(Config, "ENABLE_PERSONALIZED_FEED", False):
             session = BrowserSession(driver_factory=FakeDriver)
-            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
-            self.assertIsInstance(discoveries, list)
+            outcome = _discover(session, scan_at="2026-07-31T00:00:00Z")
+            self.assertIsInstance(outcome.projects, list)
+            self.assertEqual("not_configured", outcome.personalized_feed_status)
             session = BrowserSession(driver_factory=FakeDriver)
-            discoveries = _discover(session, scan_at="2026-07-31T00:00:00Z")
-            self.assertIsInstance(discoveries, list)
+            outcome = _discover(session, scan_at="2026-07-31T00:00:00Z")
+            self.assertIsInstance(outcome.projects, list)
 
     def test_38_discovery_sources_accumulate_across_feeds(self):
         import json

@@ -316,6 +316,14 @@ class Config:
         False,
     )
 
+    # When true, a failing or unreachable personalized feed fails the whole
+    # cycle instead of degrading it. The default keeps the primary feed the
+    # source of truth while still recording personalized status per scan.
+    PERSONALIZED_FEED_REQUIRED = _env_bool(
+        "PERSONALIZED_FEED_REQUIRED",
+        False,
+    )
+
     PERSONALIZED_FEED_DISCOVERY = _env_bool(
         "PERSONALIZED_FEED_DISCOVERY",
         False,
@@ -323,9 +331,20 @@ class Config:
 
     # Verified against the live site: sort=1 is "Newest projects first" and
     # sort=2 is "Relevant first" (radio input value / dropdown data-value).
-    PRIMARY_FEED_NEWEST_SORT_VALUE = "1"
+    # The parameter name and newest-first value are environment-configurable
+    # because the marketplace may rename them; they must be set in lockstep
+    # with FREELANCERMAP_PRIMARY_SEARCH_URL.
+    FEED_QUERY_SORT_PARAM = os.getenv(
+        "FREELANCERMAP_PRIMARY_FEED_SORT_PARAM",
+        "sort",
+    ).strip()
+
+    PRIMARY_FEED_NEWEST_SORT_VALUE = os.getenv(
+        "FREELANCERMAP_PRIMARY_FEED_NEWEST_SORT_VALUE",
+        "1",
+    ).strip()
+
     SECONDARY_FEED_ALLOWED_SORT_VALUES = ("1", "2")
-    FEED_QUERY_SORT_PARAM = "sort"
 
     ALLOW_INSECURE_HTTP = _env_bool(
         "ALLOW_INSECURE_HTTP",
@@ -380,6 +399,11 @@ class Config:
     # --disable-dev-shm-usage can hurt performance on normal desktops.
     CHROME_NO_SANDBOX = _env_bool(
         "CHROME_NO_SANDBOX",
+        False,
+    )
+
+    CHROME_DISABLE_DEV_SHM_USAGE = _env_bool(
+        "CHROME_DISABLE_DEV_SHM_USAGE",
         False,
     )
 
@@ -500,9 +524,11 @@ class Config:
         maximum=7 * 24 * 3600,
     )
 
+    # Privacy-safe by default: raw page HTML is only retained when explicitly
+    # enabled, so logged-in page content never ends up on disk by accident.
     STORE_RAW_HTML = _env_bool(
         "STORE_RAW_HTML",
-        True,
+        False,
     )
 
     AUTO_BASELINE_ON_FIRST_RUN = _env_bool(
@@ -562,14 +588,17 @@ class Config:
         True,
     )
 
+    # Privacy-safe by default: HTML and screenshot capture is off unless the
+    # operator explicitly opts in, so authenticated page content and personal
+    # data are never persisted without consent.
     DIAGNOSTIC_CAPTURE_HTML = _env_bool(
         "DIAGNOSTIC_CAPTURE_HTML",
-        True,
+        False,
     )
 
     DIAGNOSTIC_CAPTURE_SCREENSHOT = _env_bool(
         "DIAGNOSTIC_CAPTURE_SCREENSHOT",
-        True,
+        False,
     )
 
     DIAGNOSTIC_REDACT_SENSITIVE_DATA = _env_bool(
@@ -733,6 +762,31 @@ class Config:
         """
 
         errors: list[str] = []
+
+        if not cls.FEED_QUERY_SORT_PARAM or not re.fullmatch(
+            r"[A-Za-z0-9_.\-\[\]]+", cls.FEED_QUERY_SORT_PARAM
+        ):
+            errors.append(
+                "FREELANCERMAP_PRIMARY_FEED_SORT_PARAM must be a valid "
+                "query-parameter name"
+            )
+
+        if not cls.PRIMARY_FEED_NEWEST_SORT_VALUE or re.search(
+            r"[&=?#\s]", cls.PRIMARY_FEED_NEWEST_SORT_VALUE
+        ):
+            errors.append(
+                "FREELANCERMAP_PRIMARY_FEED_NEWEST_SORT_VALUE must be a "
+                "non-empty value without &, =, ?, #, or whitespace"
+            )
+
+        if (
+            cls.PERSONALIZED_FEED_REQUIRED
+            and not cls.PERSONALIZED_SEARCH_URL
+        ):
+            errors.append(
+                "PERSONALIZED_FEED_REQUIRED=true requires a non-empty "
+                "FREELANCERMAP_PERSONALIZED_SEARCH_URL"
+            )
 
         urls = [
             ("FREELANCERMAP_BASE_URL", cls.BASE_URL),

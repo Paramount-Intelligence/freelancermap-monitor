@@ -107,7 +107,10 @@ class EnhancedDatabaseTests(unittest.TestCase):
             rate="€700/day",
             scan_at=SCAN,
         ).finalize()
-        database.save_project_detail(project_id, detail, "<main>detail</main>")
+        # Raw HTML retention is privacy-safe-off by default; this test
+        # explicitly opts in to verify the opt-in storage pipeline.
+        with patch.object(Config, "STORE_RAW_HTML", True):
+            database.save_project_detail(project_id, detail, "<main>detail</main>")
         with database.connection() as conn:
             row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
             snapshots = conn.execute(
