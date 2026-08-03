@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
@@ -18,10 +21,10 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -30,11 +33,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Validate Installed Dependencies
+        run: python -m pip check
+
       - name: Compilation Check
         run: python -m compileall -q .
+
+      - name: AST Source Audit
+        run: python scripts/check_source_integrity.py
+
+      - name: Direct Import Checks
+        run: |
+          python -c "from browser import BrowserSession; print('browser import OK')"
+          python -c "from parser import ProjectDiscovery, ProjectDetail, NormalizedProject; print('parser import OK')"
+          python -c "from monitor import CycleResult, run_cycle; print('monitor import OK')"
+          python -c "import config, database, emailer, main, pagedetect; print('application imports OK')"
 
       - name: Run Unit Test Suite
         run: python -m unittest discover -s tests -v
 
       - name: Run Isolated Smoke Test
+        run: python smoke_test.py
+
+      - name: Verify SMTP-Free Smoke Environment
+        env:
+          SMTP_HOST: ""
+          SMTP_USERNAME: ""
+          SMTP_PASSWORD: ""
+          SMTP_FROM_EMAIL: ""
+          SMTP_TO_EMAILS: ""
         run: python smoke_test.py
