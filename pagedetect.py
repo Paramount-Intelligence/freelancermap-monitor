@@ -161,7 +161,42 @@ _CHALLENGE_MARKER_RE = re.compile(
     re.I,
 )
 
-# A visible challenge iframe is definitive evidence on its own.
+# A captcha *widget* iframe (reCAPTCHA / hCaptcha / Turnstile) is dual-use: it
+# is embedded in ordinary forms (apply / contact / login) on fully-rendered
+# pages AND used as the payload of an interstitial. It is therefore never
+# definitive evidence of a full-page challenge on its own.
+_WIDGET_IFRAME_RE = re.compile(
+    r"<iframe\b[^>]*\b(?:src|data-src)\s*=\s*[\"'][^\"']*"
+    r"(?:recaptcha|hcaptcha|turnstile)[^\"']*[\"']",
+    re.I,
+)
+
+# An interstitial-platform iframe (Cloudflare challenge-platform / cf-chl /
+# Arkose) is a full-page bot check by nature, so it remains definitive.
+_INTERSTITIAL_IFRAME_RE = re.compile(
+    r"<iframe\b[^>]*\b(?:src|data-src)\s*=\s*[\"'][^\"']*"
+    r"(?:challenge-platform|cf-chl|arkose)[^\"']*[\"']",
+    re.I,
+)
+
+# Markers that specifically indicate an anti-bot interstitial, as opposed to a
+# captcha widget embedded in a form. The generic captcha/recaptcha/hcaptcha/
+# turnstile terms are deliberately excluded: a widget iframe already proves a
+# captcha is present, so those words must not also count as corroboration on a
+# content-rich page (e.g. a security project whose description says "captcha").
+_INTERSTITIAL_MARKER_RE = re.compile(
+    r"\b(?:checking\s+your\s+browser|enable\s+javascript|security\s+check|"
+    r"ray\s+id|cf-chl|challenge-platform|an?\s+automated|bot\s+check|"
+    r"one\s+more\s+step|verify\s+your\s+identity|please\s+wait)\b",
+    re.I,
+)
+
+# A page whose visible body carries less than this much text is treated as
+# content-thin: a real project detail page renders thousands of characters,
+# while a bare interstitial is essentially empty apart from the widget.
+_MIN_REAL_BODY_CHARS = 200
+
+# Backwards-compatible broad pattern (kept for external/diagnostic callers).
 CHALLENGE_IFRAME_RE = re.compile(
     r"<iframe\b[^>]*\b(?:src|data-src)\s*=\s*[\"'][^\"']*"
     r"(?:recaptcha|hcaptcha|turnstile|challenge-platform|cf-chl|arkose)[^\"']*[\"']",
@@ -194,9 +229,14 @@ def detect_challenge(
     * two explicit verification phrases (e.g. title "Just a moment"
       plus body "Verify you are human") corroborate each other;
     * one explicit phrase needs at least one corroborating marker;
-    * a visible challenge iframe or a one-time-code form is definitive;
-    * a bare recaptcha script tag or a lone "please wait" is never
-      enough.
+    * a Cloudflare/Arkose interstitial iframe or a one-time-code (MFA)
+      form is definitive;
+    * a captcha *widget* iframe (reCAPTCHA / hCaptcha / Turnstile) is only
+      a challenge when the rest of the page corroborates it -- challenge
+      language in the title/body, an interstitial marker, or no real body
+      content. An embedded form widget on an otherwise content-rich page
+      (e.g. a project detail with an apply-form captcha) must never be
+      mistaken for a full-page bot block.
     """
     title = title or ""
     body = body_text or ""
@@ -211,6 +251,22 @@ def detect_challenge(
         _CHALLENGE_MARKER_RE.search(title) or _CHALLENGE_MARKER_RE.search(body)
     ):
         return True
-    if CHALLENGE_IFRAME_RE.search(source) or OTP_FORM_RE.search(source):
+
+    # A full anti-bot interstitial platform iframe, or an MFA one-time-code
+    # form, is definitive evidence of a verification gate.
+    if _INTERSTITIAL_IFRAME_RE.search(source) or OTP_FORM_RE.search(source):
         return True
+
+    # A captcha *widget* iframe is only a challenge when the page otherwise
+    # looks like an interstitial: challenge language, an interstitial marker,
+    # or a content-thin body. On a content-rich page it is a form widget.
+    if _WIDGET_IFRAME_RE.search(source):
+        thin_body = len(body.strip()) < _MIN_REAL_BODY_CHARS
+        if (
+            explicit_count >= 1
+            or _INTERSTITIAL_MARKER_RE.search(title)
+            or _INTERSTITIAL_MARKER_RE.search(body)
+            or thin_body
+        ):
+            return True
     return False

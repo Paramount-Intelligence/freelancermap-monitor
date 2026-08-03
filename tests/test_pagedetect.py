@@ -158,6 +158,56 @@ class ChallengeDetectionTests(unittest.TestCase):
         source = "<input type='text' autocomplete='one-time-code'/>"
         self.assertTrue(detect_challenge("", "", source))
 
+    def test_recaptcha_widget_on_content_rich_page_is_not_a_challenge(self) -> None:
+        source = (
+            "<iframe title='reCAPTCHA' width='304' height='78' "
+            "src='https://www.google.com/recaptcha/api2/anchor'></iframe>"
+        )
+        body = (
+            "Published on 08/03/2026 IT Integration Analyst EU Remote 6 months "
+            "Mazowieckie Poland On-site Freelance. We are looking for an "
+            "Integration Analyst to join our enterprise platform team for a "
+            "six-month assignment. The successful candidate will support data "
+            "integration, API orchestration, and incident triage across the "
+            "platform landscape."
+        )
+        self.assertFalse(
+            detect_challenge(
+                "Integration Analyst - EU Remote - 6 months on www.freelancermap.com",
+                body,
+                source,
+            )
+        )
+
+    def test_turnstile_widget_on_content_rich_page_is_not_a_challenge(self) -> None:
+        source = (
+            "<iframe src='https://challenges.cloudflare.com/turnstile/v0/abc/widget'"
+            " width='300' height='65'></iframe>"
+        )
+        body = "A" * 500  # well above the content-thin threshold
+        self.assertFalse(detect_challenge("Senior Python Developer", body, source))
+
+    def test_cloudflare_interstitial_iframe_is_definitive(self) -> None:
+        source = (
+            "<iframe src='https://challenges.cloudflare.com/cdn-cgi/challenge-platform/"
+            "h/g/cv/result'></iframe>"
+        )
+        self.assertTrue(detect_challenge("", "", source))
+
+    def test_widget_iframe_plus_interstitial_marker_is_a_challenge(self) -> None:
+        source = (
+            "<iframe src='https://www.google.com/recaptcha/api2/anchor'></iframe>"
+        )
+        self.assertTrue(
+            detect_challenge("Projects", "Checking your browser before proceeding", source)
+        )
+
+    def test_widget_iframe_with_thin_body_is_a_challenge(self) -> None:
+        source = (
+            "<iframe src='https://www.google.com/recaptcha/api2/anchor'></iframe>"
+        )
+        self.assertTrue(detect_challenge("", "short page", source))
+
 
 class SharedSemanticsTests(unittest.TestCase):
     def test_browser_regexes_are_the_shared_pattern(self) -> None:
